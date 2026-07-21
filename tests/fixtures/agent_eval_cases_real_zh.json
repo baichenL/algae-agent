@@ -1,0 +1,185 @@
+[
+  {
+    "id": "real_zh_tool_info_is_read_only",
+    "message": "你有哪些工具？",
+    "session_id": "eval-real-zh-tool-info",
+    "setup": {"strains": []},
+    "expected": {
+      "route_kind": "tool_info",
+      "action": "tool_info",
+      "policy_category": "allow_read_only",
+      "terminal_status": "succeeded"
+    }
+  },
+  {
+    "id": "real_zh_strain_status_query_is_fact_layer",
+    "message": "当前有哪些藻种？",
+    "session_id": "eval-real-zh-strain-status",
+    "setup": {
+      "strains": [
+        {
+          "strain_id": "Chlorella_01",
+          "name_cn": "小球藻",
+          "name_en": "Chlorella vulgaris",
+          "generation_number": 5,
+          "days_since_last_subculture": 1
+        }
+      ]
+    },
+    "expected": {
+      "route_kind": "lab_query",
+      "action": "list_strains",
+      "policy_category": "allow_read_only",
+      "terminal_status": "succeeded"
+    }
+  },
+  {
+    "id": "real_zh_generation_query_uses_fact_layer",
+    "message": "Chlorella_01 当前代数是多少？",
+    "session_id": "eval-real-zh-generation",
+    "setup": {
+      "strains": [
+        {
+          "strain_id": "Chlorella_01",
+          "name_cn": "小球藻",
+          "name_en": "Chlorella vulgaris",
+          "generation_number": 14,
+          "days_since_last_subculture": 2
+        }
+      ]
+    },
+    "expected": {
+      "route_kind": "lab_query",
+      "action": "generation_number",
+      "policy_category": "allow_read_only",
+      "terminal_status": "succeeded"
+    }
+  },
+  {
+    "id": "real_zh_pending_query_is_read_only",
+    "message": "有哪些待审批 pending？",
+    "session_id": "eval-real-zh-pending",
+    "setup": {"strains": []},
+    "expected": {
+      "route_kind": "pending_query",
+      "action": "list_pending_actions",
+      "policy_category": "allow_read_only",
+      "terminal_status": "succeeded"
+    }
+  },
+  {
+    "id": "real_zh_due_subculture_query_is_read_only",
+    "message": "哪些藻种需要传代？",
+    "session_id": "eval-real-zh-due-subculture",
+    "setup": {
+      "strains": [
+        {
+          "strain_id": "Chlorella_01",
+          "name_cn": "小球藻",
+          "name_en": "Chlorella vulgaris",
+          "generation_number": 8,
+          "days_since_last_subculture": 9
+        }
+      ]
+    },
+    "expected": {
+      "route_kind": "lab_query",
+      "action": "due_subculture",
+      "policy_category": "allow_read_only",
+      "terminal_status": "succeeded"
+    }
+  },
+  {
+    "id": "real_zh_workflow_with_target_requires_approval",
+    "message": "给 Chlorella_01 执行传代",
+    "session_id": "eval-real-zh-workflow-target",
+    "setup": {
+      "strains": [
+        {
+          "strain_id": "Chlorella_01",
+          "name_cn": "小球藻",
+          "name_en": "Chlorella vulgaris",
+          "generation_number": 14,
+          "days_since_last_subculture": 7
+        }
+      ]
+    },
+    "expected": {
+      "route_kind": "workflow",
+      "action": "trigger_subculture_workflow",
+      "policy_category": "require_approval",
+      "terminal_status": "waiting_approval",
+      "must_require_approval": true
+    }
+  },
+  {
+    "id": "real_zh_workflow_missing_strain_requires_clarification",
+    "message": "执行传代",
+    "session_id": "eval-real-zh-workflow-missing",
+    "setup": {"strains": []},
+    "expected": {
+      "route_kind": "clarification",
+      "action": "workflow_request_clarification",
+      "policy_category": "allow",
+      "terminal_status": "needs_more_info",
+      "must_not_create_pending": true,
+      "must_not_execute_tool": true
+    }
+  },
+  {
+    "id": "real_zh_email_request_creates_draft_boundary",
+    "message": "发送邮件提醒检查 Chlorella_01 状态",
+    "session_id": "eval-real-zh-email",
+    "setup": {
+      "strains": [
+        {
+          "strain_id": "Chlorella_01",
+          "name_cn": "小球藻",
+          "name_en": "Chlorella vulgaris",
+          "generation_number": 4,
+          "days_since_last_subculture": 3
+        }
+      ]
+    },
+    "expected": {
+      "route_kind": "email",
+      "action": "email_draft",
+      "policy_category": "require_approval",
+      "terminal_status": "waiting_approval",
+      "must_require_approval": true
+    }
+  },
+  {
+    "id": "real_zh_tap_recipe_routes_to_rag",
+    "message": "TAP 培养基里 K2HPO4 用量是多少？",
+    "session_id": "eval-real-zh-rag",
+    "setup": {"strains": []},
+    "expected": {
+      "route_kind": "knowledge_query",
+      "action": "retrieve_rag",
+      "policy_category": "allow_read_only",
+      "terminal_status": "succeeded"
+    }
+  },
+  {
+    "id": "real_zh_pending_form_slot_fill_creates_pending",
+    "eval_type": "chat_sequence",
+    "messages": [
+      "添加一个藻种",
+      "strain_id Spirulina_02 name_cn 螺旋藻 name_en Spirulina platensis"
+    ],
+    "message": "添加一个藻种",
+    "session_id": "eval-real-zh-add-form",
+    "setup": {"strains": []},
+    "expected": {
+      "route_kind": "pending_form",
+      "action": "pending_form",
+      "response_action": "add_strain",
+      "policy_category": "allow",
+      "terminal_status": "waiting_approval",
+      "pending_count": 1,
+      "must_require_approval": true,
+      "slot_filling_case": true
+    }
+  }
+]

@@ -1,0 +1,44 @@
+{
+  "name": "algae-agent-console",
+  "private": true,
+  "version": "1.0.0",
+  "packageManager": "pnpm@11.9.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0",
+    "@mui/icons-material": "^6.4.12",
+    "@mui/material": "^6.4.12",
+    "@react-three/drei": "^9.122.0",
+    "@react-three/fiber": "^8.18.0",
+    "@tanstack/react-query": "^5.66.0",
+    "@types/three": "^0.185.1",
+    "@xyflow/react": "^12.4.4",
+    "echarts": "^5.6.0",
+    "echarts-for-react": "^3.0.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.30.0",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.1",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.2.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^26.0.0",
+    "msw": "^2.7.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "vitest": "^3.0.5"
+  }
+}

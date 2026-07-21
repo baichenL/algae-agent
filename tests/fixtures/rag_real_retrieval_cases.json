@@ -1,0 +1,79 @@
+[
+  {
+    "id": "tap_recipe_component_amount",
+    "query": "TAP 培养基里 K2HPO4 用量是多少？",
+    "doc_types": ["media_recipe", "manual"],
+    "fixture_sources": [
+      {
+        "source_id": "tap_recipe_sop",
+        "file_name": "TAP_medium_recipe.md",
+        "doc_type": "media_recipe",
+        "content_kind": "structured_recipe",
+        "content_summary": "TAP 配方表，包含 K2HPO4、KH2PO4、NH4Cl、MgSO4 等组分和每升用量。"
+      }
+    ],
+    "expected": {
+      "must_cite_source": true,
+      "must_not_trigger_tool": true,
+      "must_not_use_as_current_db_fact": true,
+      "expected_entity": "K2HPO4"
+    }
+  },
+  {
+    "id": "manual_protocol_subculture_steps",
+    "query": "SOP 里传代前需要检查哪些步骤？",
+    "doc_types": ["manual"],
+    "fixture_sources": [
+      {
+        "source_id": "subculture_manual",
+        "file_name": "subculture_sop.md",
+        "doc_type": "manual",
+        "content_kind": "sop_steps",
+        "content_summary": "传代 SOP，包含污染检查、培养状态记录、审批确认和操作后记录。"
+      }
+    ],
+    "expected": {
+      "must_cite_source": true,
+      "must_not_trigger_workflow": true,
+      "must_not_approve_pending": true
+    }
+  },
+  {
+    "id": "experiment_table_field_lookup",
+    "query": "实验表格里有没有 OD750 字段？",
+    "doc_types": ["experiment_data"],
+    "fixture_sources": [
+      {
+        "source_id": "growth_table_schema",
+        "file_name": "growth_curve_schema.csv",
+        "doc_type": "experiment_data",
+        "content_kind": "table_schema",
+        "content_summary": "结构化实验表字段，包括 sample_id、time_h、OD750、temperature_c。"
+      }
+    ],
+    "expected": {
+      "must_cite_source": true,
+      "must_answer_from_schema": true,
+      "must_not_claim_current_lab_state": true
+    }
+  },
+  {
+    "id": "paper_protocol_background_only",
+    "query": "论文里有没有小球藻高光胁迫培养 protocol？",
+    "doc_types": ["paper"],
+    "fixture_sources": [
+      {
+        "source_id": "chlorella_light_stress_paper",
+        "file_name": "chlorella_light_stress_protocol.pdf",
+        "doc_type": "paper",
+        "content_kind": "paper_protocol",
+        "content_summary": "论文方法片段，描述 Chlorella vulgaris 高光胁迫培养条件。"
+      }
+    ],
+    "expected": {
+      "must_cite_source": true,
+      "must_label_as_reference_not_current_sop": true,
+      "must_not_trigger_tool": true
+    }
+  }
+]

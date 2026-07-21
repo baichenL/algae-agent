@@ -1,0 +1,193 @@
+# =========================================================
+
+# Python cache / compiled files
+
+# =========================================================
+
+**pycache**/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# C extensions
+
+*.so
+
+# =========================================================
+
+# Virtual environments
+
+# =========================================================
+
+.venv/
+venv/
+env/
+ENV/
+LSTM/
+
+# =========================================================
+
+# Environment variables / secrets
+
+# =========================================================
+
+.env
+.env.*
+!.env.example
+
+# Private project material (never publish)
+
+docs/
+private/
+internal/
+secrets/
+credentials/
+
+# Keys, certificates, and provider credentials
+
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+*credentials*.json
+*service-account*.json
+.aws/
+.gcp/
+
+# =========================================================
+
+# Local databases / runtime data
+
+# =========================================================
+
+*.db
+*.sqlite
+*.sqlite3
+
+data/outputs/
+data/logs/
+
+# Keep raw data folder structure if needed
+
+data/raw/*
+!data/raw/.gitkeep
+
+# =========================================================
+
+# Runtime logs
+
+# =========================================================
+
+*.log
+*.jsonl
+
+# =========================================================
+
+# Debug / temporary history files
+
+# =========================================================
+
+history_*.json
+*_debug*.json
+*_test*.json
+
+# =========================================================
+
+# Streamlit secrets / cache
+
+# =========================================================
+
+.streamlit/secrets.toml
+.streamlit/cache/
+
+# =========================================================
+
+# Testing / linting / type checking cache
+
+# =========================================================
+
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# =========================================================
+
+# Jupyter
+
+# =========================================================
+
+.ipynb_checkpoints/
+
+# =========================================================
+
+# IDE / editor
+
+# =========================================================
+
+.vscode/
+.idea/
+
+# =========================================================
+
+# OS files
+
+# =========================================================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================================================
+
+# Docker / local override files
+
+# =========================================================
+
+docker-compose.override.yml
+
+# =========================================================
+
+# Build / packaging
+
+# =========================================================
+
+build/
+dist/
+node_modules/
+.pnpm-store/
+playwright-report/
+test-results/
+*.tsbuildinfo
+*.egg-info/
+.eggs/
+
+# =========================================================
+
+# Project temporary files
+
+# =========================================================
+
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# =========================================================
+
+# Project tree output
+
+# =========================================================
+
+project_tree.txt
+tree.txt

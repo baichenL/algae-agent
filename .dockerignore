@@ -1,0 +1,17 @@
+.git
+.env
+.pytest_cache
+**/__pycache__
+**/*.pyc
+web/node_modules
+web/dist
+data/logs
+data/outputs
+*.sqlite3
+web/.pytest_cache
+web/.pytest_cache/**
+**/.pytest_cache
+**/.pytest_cache/**
+**/__pycache__
+**/__pycache__/**
+*.pyc
