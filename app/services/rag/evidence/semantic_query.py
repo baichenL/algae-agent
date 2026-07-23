@@ -443,11 +443,11 @@ def _link_condition(text: str) -> list[TypedEntity]:
     surface = match.group(1).strip()
     if not surface:
         return []
-    entity_type = "organism" if re.search(r"钘粅鑿寍鍝佺郴|strain|species", surface, re.I) else "experimental_condition"
+    entity_type = "organism" if re.search(r"藻|菌|品系|strain|species", surface, re.I) else "experimental_condition"
     canonical_surface = surface
     if entity_type == "organism":
-        canonical_surface = re.sub(r"^(?:鎵€鏈墊鍏ㄩ儴|浠绘剰|浠讳綍)\s*", "", canonical_surface)
-        canonical_surface = re.sub(r"(?:鍏ㄩ儴)?鍝佺郴$", "", canonical_surface).strip()
+        canonical_surface = re.sub(r"^(?:所有|全部|任意|任何)\s*", "", canonical_surface)
+        canonical_surface = re.sub(r"(?:全部)?品系$", "", canonical_surface).strip()
     return [
         TypedEntity(
             entity_type=entity_type,
@@ -615,7 +615,7 @@ def _alias_in_text(alias: str, text: str) -> bool:
 def _parse_point_count(value: str) -> int | None:
     if value.isdigit():
         return int(value)
-    digits = {"?": 1, "?": 2, "?": 3, "?": 4, "?": 5, "?": 6, "?": 7, "?": 8, "?": 9, "?": 10}
+    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
     return digits.get(value)
 
 

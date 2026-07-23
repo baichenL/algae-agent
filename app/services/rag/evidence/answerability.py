@@ -450,7 +450,7 @@ def _explicit_statement_evidence(frame: QueryFrame, evidence: list[EvidenceUnit]
         text = item.text_span or ""
         if target_attribute == "dark_culture" and re.search(r"黑暗|dark", text, re.I):
             matches.append(item)
-        elif target_attribute == "strain_applicability" and re.search(r"all|所有|全部|Chlorella|小球�", text, re.I):
+        elif target_attribute == "strain_applicability" and re.search(r"all|所有|全部|Chlorella|小球藻", text, re.I):
             matches.append(item)
         elif target_attribute == "suitability" and re.search(r"适合|适用于|suitable|applicable", text, re.I):
             matches.append(item)

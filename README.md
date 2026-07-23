@@ -274,6 +274,21 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
+默认 Compose 使用不可变的镜像代码、Docker named volume `algae-data`，并只监听
+`127.0.0.1`。`ALGAE_FRONTEND_API_KEY` 必须与 `ALGAE_API_KEYS_JSON` 中配置的密钥一致；
+需要允许其他主机访问时，再显式设置 `ALGAE_BIND_HOST=0.0.0.0` 并配置外围访问控制。
+
+需要把工作区源码和 `./data` 挂载进容器进行本地开发时，显式叠加开发配置：
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+开发覆盖配置默认使用 `ALGAE_DEV_UID=0`、`ALGAE_DEV_GID=0`，以兼容 Windows
+Docker Desktop 中由旧版 root 容器创建的 SQLite 文件；基础 Compose 镜像仍以非 root
+用户运行。开发配置只补回 SQLite 兼容所需的 `DAC_OVERRIDE` 和 `FOWNER`；Linux 开发
+环境可把这两个 UID/GID 值改为宿主用户的 `id -u` 和 `id -g`。
+
 - React 统一控制台：<http://127.0.0.1:8000/app>
 - API 文档：<http://127.0.0.1:8000/docs>
 - Legacy Streamlit：<http://127.0.0.1:8501>

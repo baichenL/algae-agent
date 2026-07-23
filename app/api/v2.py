@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Literal
@@ -26,7 +27,7 @@ from app.core.session_security import (
 )
 from app.core.security import ApiPrincipal
 from app.schemas.algae import ChatRequest
-from app.models.rag_schema import RagQueryRequest
+from app.models.rag_schema import RagGenerationCreateRequest, RagQueryRequest
 from app.services.chat.chat_service import handle_chat
 from app.services.user_memory.service import process_completed_turn
 from app.services.agent_runtime.state import RuntimeRequestContext
@@ -34,6 +35,7 @@ from app.services.control_plane import dashboard, get_events, get_run, list_appr
 from app.services.scientific.service import approve_and_simulate_proposal, run_scientific_task
 from app.services.rag.service import answer_rag_question
 from app.services.rag.knowledge_asset_service import index_source, list_sources, save_uploaded_source
+from app.services.rag.generation_service import activate_generation, build_shadow_generation
 from app.services.strains import strain_service
 from app.services.workflows.simulation_service import simulation_runs
 from app.services.workflows.workflow_approval_service import grant_workflow_approval
@@ -237,32 +239,42 @@ def _index_knowledge_operation(
                 progress=0.18,
             )
             operations.update_operation(
-                operation_id,
-                phase="chunking",
-                message="正在分块并建立索引",
-                progress=0.55,
+                operation_id, phase="chunking", message="正在分块并建立索引", progress=0.55
             )
             index_source(source_id, rebuild=rebuild)
             source = database.get_rag_knowledge_source(source_id) or {}
             if source.get("ingestion_status") == "failed":
                 raise RuntimeError(str(source.get("last_error") or "knowledge_index_failed"))
             operations.update_operation(
-                operation_id,
-                status="succeeded",
-                phase="completed",
-                message="知识文件索引完成",
-                progress=1.0,
-                retryable=False,
+                operation_id, status="succeeded", phase="completed", message="知识文件索引完成",
+                progress=1.0, retryable=False,
             )
         except Exception as exc:
             operations.update_operation(
-                operation_id,
-                status="failed",
-                phase="failed",
-                message="知识文件索引失败",
-                error_code=exc.__class__.__name__,
-                error_message=str(exc),
-                retryable=True,
+                operation_id, status="failed", phase="failed", message="知识文件索引失败",
+                error_code=exc.__class__.__name__, error_message=str(exc), retryable=True,
+            )
+
+
+def _build_rag_generation_operation(
+    *, operation_id: str, generation_id: str | None, source_roots: list[str], workspace: WorkspaceContext
+) -> None:
+    with workspace_scope(workspace):
+        try:
+            operations.update_operation(
+                operation_id, status="running", phase="discovering", message="正在发现正式知识源", progress=0.08
+            )
+            generation = build_shadow_generation(generation_id=generation_id, source_roots=source_roots or None)
+            if generation.get("status") != "ready":
+                raise RuntimeError(str(generation.get("error_message") or "generation_release_gates_failed"))
+            operations.update_operation(
+                operation_id, status="succeeded", phase="ready", message="影子索引已通过发布门禁",
+                progress=1.0, retryable=False, metadata={"generation_id": generation["generation_id"]},
+            )
+        except Exception as exc:
+            operations.update_operation(
+                operation_id, status="failed", phase="failed", message="影子索引构建或门禁失败",
+                error_code=exc.__class__.__name__, error_message=str(exc), retryable=True,
             )
 
 
@@ -1358,6 +1370,47 @@ async def knowledge_query(payload: RagQueryRequest, _: ApiPrincipal = Depends(re
         raise HTTPException(status_code=500, detail=f"RAG query failed: {exc}") from exc
 
 
+@router.post("/knowledge/index-generations", status_code=202)
+async def create_knowledge_index_generation(
+    payload: RagGenerationCreateRequest,
+    background_tasks: BackgroundTasks,
+    principal: ApiPrincipal = Depends(require_session_scientist),
+):
+    generation_id = payload.generation_id or f"rag-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    workspace = current_workspace()
+    operation = operations.create_operation(
+        owner=principal.name, workspace_id=workspace.id, kind="knowledge_generation_build",
+        label="构建 RAG 影子索引", phase="queued", message="影子索引已排队",
+        related_entity_type="rag_index_generation", related_entity_id=generation_id,
+        metadata={"generation_id": generation_id, "source_roots": payload.source_roots}, retryable=True,
+    )
+    background_tasks.add_task(
+        _build_rag_generation_operation, operation_id=operation["id"], generation_id=generation_id,
+        source_roots=payload.source_roots, workspace=workspace,
+    )
+    return {"status": "accepted", "generation_id": generation_id, "operation_id": operation["id"], "operation": operation}
+
+
+@router.get("/knowledge/index-generations/{generation_id}")
+async def get_knowledge_index_generation(
+    generation_id: str, _: ApiPrincipal = Depends(require_session_scientist)
+):
+    generation = database.get_rag_index_generation(generation_id)
+    if not generation:
+        raise HTTPException(status_code=404, detail="rag_generation_not_found")
+    return {"status": "success", "generation": generation}
+
+
+@router.post("/knowledge/index-generations/{generation_id}/activate")
+async def activate_knowledge_index_generation(
+    generation_id: str, _: ApiPrincipal = Depends(require_session_scientist)
+):
+    result = activate_generation(generation_id)
+    if not result["activated"]:
+        raise HTTPException(status_code=409, detail=result)
+    return {"status": "success", **result}
+
+
 @router.get("/knowledge/sources")
 async def knowledge_sources(
     include_archived: bool = True,
@@ -1374,6 +1427,10 @@ async def upload_knowledge_source(
     title: str | None = Form(default=None),
     version: str | None = Form(default=None),
     language: str | None = Form(default=None),
+    asset_key: str | None = Form(default=None),
+    effective_from: str | None = Form(default=None),
+    effective_to: str | None = Form(default=None),
+    supersedes_source_id: str | None = Form(default=None),
     principal: ApiPrincipal = Depends(require_session_scientist),
 ):
     try:
@@ -1385,6 +1442,10 @@ async def upload_knowledge_source(
             title=title,
             version=version,
             language=language,
+            asset_key=asset_key,
+            effective_from=effective_from,
+            effective_to=effective_to,
+            supersedes_source_id=supersedes_source_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

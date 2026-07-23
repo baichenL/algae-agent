@@ -5,6 +5,16 @@ on:
   pull_request:
 
 jobs:
+  docker-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config -q
+        env:
+          ALGAE_FRONTEND_API_KEY: replace-viewer-key
+      - run: docker build --check .
+
   ubuntu-full:
     runs-on: ubuntu-latest
     steps:
@@ -14,6 +24,7 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: python -m pip install -r requirements.txt
+      - run: python scripts/check_rag_encoding.py
       - run: pytest -q
       - run: python scripts/run_scientific_eval.py
 

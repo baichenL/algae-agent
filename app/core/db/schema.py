@@ -1,6 +1,7 @@
 import datetime
 import os
 import sqlite3
+from pathlib import Path
 
 from app.core.db.connection import DB_PATH
 from app.core.time_utils import local_time_string
@@ -665,6 +666,32 @@ def init_db():
         conn.commit()
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rag_index_generations (
+                generation_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK(status IN ('building', 'ready', 'active', 'failed', 'retired')),
+                schema_version TEXT NOT NULL,
+                parser_policy_version TEXT,
+                embedding_model TEXT,
+                embedding_dimension INTEGER,
+                reranker_model TEXT,
+                source_snapshot_hash TEXT,
+                health_json TEXT,
+                metrics_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                ready_at TEXT,
+                activated_at TEXT,
+                retired_at TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_rag_one_active_generation
+            ON rag_index_generations(status)
+            WHERE status = 'active'
+        """)
+
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS rag_documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_path TEXT NOT NULL UNIQUE,
@@ -1039,6 +1066,24 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_rag_document_elements_hash
             ON rag_document_elements (content_hash)
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rag_hierarchy_nodes (
+                node_id TEXT PRIMARY KEY,
+                generation_id TEXT NOT NULL DEFAULT 'legacy',
+                document_id INTEGER NOT NULL,
+                level INTEGER NOT NULL,
+                parent_node_id TEXT,
+                title TEXT,
+                summary TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(document_id) REFERENCES rag_documents(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_rag_hierarchy_generation
+            ON rag_hierarchy_nodes (generation_id, level, document_id)
+        """)
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS rag_trace_logs (
@@ -1090,7 +1135,12 @@ def init_db():
                 expected_route TEXT,
                 required_evidence_types_json TEXT,
                 expected_answer_contains_json TEXT,
+                expected_evidence_labels_json TEXT,
+                retrieval_mode TEXT DEFAULT 'auto',
+                version_policy TEXT DEFAULT 'current',
+                as_of TEXT,
                 expected_refusal INTEGER DEFAULT 0,
+                expected_action_escalation INTEGER DEFAULT 0,
                 notes TEXT
             )
         """)
@@ -1133,6 +1183,10 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_rag_evidence_links_evidence
             ON rag_evidence_links (evidence_id, entity_id)
         """)
+
+        _ensure_rag_eval_case_columns(cursor)
+        _ensure_rag_generation_columns(cursor)
+        _initialize_legacy_rag_generation(cursor)
 
         conn.commit()
 
@@ -1210,10 +1264,25 @@ def _ensure_rag_knowledge_source_columns(cursor):
         "archived_by": "TEXT",
         "chunk_count": "INTEGER DEFAULT 0",
         "last_error": "TEXT",
+        "canonical_source_path": "TEXT",
+        "asset_key": "TEXT",
+        "effective_from": "TEXT",
+        "effective_to": "TEXT",
+        "supersedes_source_id": "TEXT",
+        "security_flags_json": "TEXT DEFAULT '[]'",
+        "review_status": "TEXT DEFAULT 'approved'",
     }
     for column_name, column_def in required_columns.items():
         if column_name not in existing_columns:
             cursor.execute(f"ALTER TABLE rag_knowledge_sources ADD COLUMN {column_name} {column_def}")
+    cursor.execute("SELECT source_id, source_path, doc_type, file_name, canonical_source_path, asset_key FROM rag_knowledge_sources")
+    for source_id, source_path, doc_type, file_name, canonical, asset_key in cursor.fetchall():
+        canonical = canonical or os.path.normcase(os.path.abspath(os.path.normpath(str(source_path)))).replace("\\", "/")
+        topic = Path(file_name or source_path).stem.casefold().replace(" ", "_")
+        cursor.execute(
+            "UPDATE rag_knowledge_sources SET canonical_source_path = ?, asset_key = COALESCE(asset_key, ?) WHERE source_id = ?",
+            (canonical, f"{doc_type}:{topic}", source_id),
+        )
 
 
 def _ensure_agent_run_columns(cursor):
@@ -1263,3 +1332,105 @@ def _ensure_rag_evidence_unit_columns(cursor):
     for column_name, column_def in required_columns.items():
         if column_name not in existing_columns:
             cursor.execute(f"ALTER TABLE rag_evidence_units ADD COLUMN {column_name} {column_def}")
+
+
+def _ensure_rag_eval_case_columns(cursor):
+    cursor.execute("PRAGMA table_info(rag_eval_cases)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    required_columns = {
+        "expected_evidence_labels_json": "TEXT",
+        "retrieval_mode": "TEXT DEFAULT 'auto'",
+        "version_policy": "TEXT DEFAULT 'current'",
+        "as_of": "TEXT",
+        "expected_action_escalation": "INTEGER DEFAULT 0",
+    }
+    for column_name, column_def in required_columns.items():
+        if column_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE rag_eval_cases ADD COLUMN {column_name} {column_def}")
+
+
+def _ensure_rag_generation_columns(cursor):
+    """Add generation metadata without destructively rebuilding legacy tables."""
+    table_columns = {
+        "rag_documents": {
+            "generation_id": "TEXT DEFAULT 'legacy'",
+            "source_id": "TEXT",
+            "canonical_source_path": "TEXT",
+            "index_schema_version": "TEXT",
+        },
+        "rag_chunks": {
+            "generation_id": "TEXT DEFAULT 'legacy'",
+            "context_prefix": "TEXT",
+            "index_text": "TEXT",
+        },
+        "rag_chunk_embeddings": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_source_schemas": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_recipe_components": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_sop_facts": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_paper_facts": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_experiment_data_values": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_evidence_units": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_document_elements": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_hierarchy_nodes": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_retrieval_traces": {"generation_id": "TEXT"},
+        "rag_entities": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_relations": {"generation_id": "TEXT DEFAULT 'legacy'"},
+        "rag_evidence_links": {"generation_id": "TEXT DEFAULT 'legacy'"},
+    }
+    for table_name, required in table_columns.items():
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        existing = {row[1] for row in cursor.fetchall()}
+        for column_name, column_def in required.items():
+            if column_name not in existing:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rag_documents_generation ON rag_documents(generation_id, status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rag_chunks_generation ON rag_chunks(generation_id, doc_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rag_evidence_generation ON rag_evidence_units(generation_id, evidence_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rag_embeddings_generation ON rag_chunk_embeddings(generation_id, embedding_model)")
+
+
+def _initialize_legacy_rag_generation(cursor):
+    now = local_time_string()
+    document_count = int(cursor.execute("SELECT COUNT(*) FROM rag_documents").fetchone()[0])
+    legacy_id = f"legacy-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}" if document_count else "legacy"
+    cursor.execute("SELECT generation_id FROM rag_index_generations WHERE status = 'active' LIMIT 1")
+    active = cursor.fetchone()
+    if active is None:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO rag_index_generations
+            (generation_id, status, schema_version, parser_policy_version,
+             health_json, metrics_json, created_at, updated_at, activated_at)
+            VALUES (?, 'active', 'legacy', 'legacy', '{}', '{}', ?, ?, ?)
+            """,
+            (legacy_id, now, now, now),
+        )
+    elif active[0] == "legacy" and document_count:
+        legacy_id = f"legacy-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+        cursor.execute("UPDATE rag_index_generations SET generation_id = ? WHERE generation_id = 'legacy'", (legacy_id,))
+    else:
+        legacy_id = str(active[0])
+    for table_name in (
+        "rag_documents", "rag_chunks", "rag_chunk_embeddings", "rag_source_schemas",
+        "rag_recipe_components", "rag_sop_facts", "rag_paper_facts",
+        "rag_experiment_data_values", "rag_evidence_units", "rag_document_elements",
+        "rag_hierarchy_nodes", "rag_entities", "rag_relations", "rag_evidence_links",
+    ):
+        cursor.execute(
+            f"UPDATE {table_name} SET generation_id = ? WHERE generation_id IS NULL OR generation_id = 'legacy'",
+            (legacy_id,),
+        )
+    cursor.execute("UPDATE rag_documents SET canonical_source_path = COALESCE(canonical_source_path, source_path)")
+    sources = cursor.execute("SELECT source_id, canonical_source_path, source_path FROM rag_knowledge_sources").fetchall()
+    source_map = {
+        os.path.normcase(os.path.abspath(os.path.normpath(str(canonical or path)))).replace("\\", "/").casefold(): source_id
+        for source_id, canonical, path in sources
+    }
+    for document_id, canonical, path in cursor.execute(
+        "SELECT id, canonical_source_path, source_path FROM rag_documents WHERE source_id IS NULL"
+    ).fetchall():
+        normalized = str(canonical or path).split("#rag-generation=", 1)[0]
+        key = os.path.normcase(os.path.abspath(os.path.normpath(normalized))).replace("\\", "/").casefold()
+        if source_map.get(key):
+            cursor.execute("UPDATE rag_documents SET source_id = ? WHERE id = ?", (source_map[key], document_id))

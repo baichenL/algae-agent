@@ -1,6 +1,7 @@
 ﻿import re
 
 from app.models.rag_evidence_schema import QueryFrame
+from app.services.rag.query_normalizer import normalize_rag_query
 from app.services.rag.evidence.semantic_query import (
     expand_group_subqueries,
     parse_semantic_query,
@@ -308,43 +309,34 @@ def _is_column_existence_question(text: str) -> bool:
 
 
 def _is_column_equivalence_question(text: str) -> bool:
-    return bool(
-        re.search(
-            r"鍚屼竴涓瓧娈祙鍚屼竴瀛楁|涓€鏍穦鐩稿悓|绛夊悓|equivalent|same field|same column",
-            text,
-            re.I,
-        )
-    )
+    return bool(re.search(r"同一个字段|同一字段|一样|相同|等同|equivalent|same field|same column", text, re.I))
 
 
 def _is_manual_question(text: str) -> bool:
-    return bool(re.search(r"瀹為獙鎵嬪唽|鎵嬪唽|SOP|manual|protocol|鎿嶄綔|姝ラ|娴佺▼|鐢靛嚮|杞寲|骞虫澘|澶嶈嫃|鎭㈠鍩瑰吇", text, re.I))
+    normalized = normalize_rag_query(text)
+    return "manual" in normalized.doc_types or bool(
+        re.search(r"实验手册|手册|SOP|manual|protocol|操作|步骤|流程|电击|转化|平板|复苏|恢复培养", normalized.normalized_query, re.I)
+    )
 
 
 def _is_paper_question(text: str) -> bool:
-    return bool(
-        re.search(
-            r"璁烘枃|paper|鏂囩尞|literature|machine learning|deep learning|data-driven|growth prediction|forecasting",
-            text,
-            re.I,
-        )
+    normalized = normalize_rag_query(text)
+    return "paper" in normalized.doc_types or bool(
+        re.search(r"论文|文献|paper|literature|machine learning|deep learning|data-driven|growth prediction|forecasting", normalized.normalized_query, re.I)
     )
 
 
 def _is_recipe_question(text: str) -> bool:
-    return bool(
-        re.search(
-            r"閰嶆柟|鍩瑰吇鍩簗鎴愬垎|缁勫垎|component|recipe|medium|TAP|NaCl|NH4Cl|NH鈧凜l|K2HPO4|K鈧侶PO鈧剕KH2PO4|KH鈧侾O鈧剕MgSO4|CaCl2",
-            text,
-            re.I,
-        )
+    normalized = normalize_rag_query(text)
+    return "media_recipe" in normalized.doc_types or bool(
+        re.search(r"配方|培养基|成分|组分|component|recipe|medium|TAP|NaCl|NH4Cl|K2HPO4|KH2PO4|MgSO4|CaCl2", normalized.normalized_query, re.I)
     )
 
 
 def _is_entity_overview_question(text: str) -> bool:
     return bool(
         re.search(
-            r"浠嬬粛|绠€浠媩姒傝堪|鏄粈涔坾璁茶|璇存槑涓€涓媩浜嗚В涓€涓媩overview|introduction|tell me about|what is",
+            r"介绍|简介|概述|是什么|讲讲|说明一下|了解一下|overview|introduction|tell me about|what is",
             text,
             re.I,
         )
@@ -353,7 +345,7 @@ def _is_entity_overview_question(text: str) -> bool:
 
 def _is_recipe_group_list_question(text: str) -> bool:
     return _is_list_question(text) and bool(
-        re.search(r"纾烽吀鐩恷鐩愭憾娑瞸寰噺鍏冪礌|Hutner|trace|phosphate|宸ヤ綔娑瞸姣嶆恫", text, re.I)
+        re.search(r"磷酸盐|盐溶液|微量元素|Hutner|trace|phosphate|工作液|母液", text, re.I)
     )
 
 
@@ -362,8 +354,8 @@ def _is_component_existence_question(text: str) -> bool:
         re.search(r"component|recipe|medium|TAP", text, re.I)
     ):
         return True
-    return bool(re.search(r"鏈夋病鏈墊鏄惁鍖呭惈|鏄惁鍚湁|鍖呭惈.*鍚梶鍚笉鍚珅鏈夋棤", text, re.I)) and bool(
-        re.search(r"閰嶆柟|鍩瑰吇鍩簗鎴愬垎|缁勫垎|component|recipe|medium|TAP", text, re.I)
+    return bool(re.search(r"有没有|是否包含|是否含有|包含.*吗|含不含|有无", text, re.I)) and bool(
+        re.search(r"配方|培养基|成分|组分|component|recipe|medium|TAP", text, re.I)
     )
 
 
@@ -564,20 +556,15 @@ def _extract_paper_attribute(text: str) -> str:
         return "od750_prediction"
     if re.search(r"directly applicable|project.*(?:culture|cultivation).*parameter|project.*parameter", text, re.I):
         return "project_parameter"
-    if re.search(r"鍙洿鎺鏈」鐩畖鍩瑰吇鍙傛暟|鎵ц鍙傛暟|姝ｅ紡瀹為獙|鐩存帴閲囩敤", text, re.I):
+    if re.search(r"可直接用于本项目|培养参数|执行参数|正式实验|直接采用", text, re.I):
         return "project_parameter"
-    if re.search(r"妯″瀷|鏂规硶|machine learning|deep learning|data-driven|棰勬祴|prediction|forecast", text, re.I):
+    if re.search(r"模型|方法|machine learning|deep learning|data-driven|预测|prediction|forecast", text, re.I):
         return "method_used"
     return "topic_presence"
 
 
 def _raw_terms(text: str) -> list[str]:
-    terms = []
-    for raw in re.split(r"\s+|[锛屻€傦紒锟?,.;锛涳細:()锛堬級]", text):
-        token = raw.strip()
-        if token and token not in terms:
-            terms.append(token)
-    return terms
+    return normalize_rag_query(text).sparse_terms
 
 
 def _matches_any(text: str, patterns: list[str]) -> bool:

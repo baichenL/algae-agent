@@ -76,11 +76,11 @@ def infer_column_role(name: str) -> str:
     raw = (name or "").lower()
     if normalized in {"time_h", "time", "时间_h", "时间"} or "时间" in raw:
         return "time"
-    if normalized in {"i", "iumol_m_2_s_1"} or re.search(r"light|irradiance|�", raw, re.I):
+    if normalized in {"i", "iumol_m_2_s_1"} or re.search(r"light|irradiance|光照|光强", raw, re.I):
         return "light_or_irradiance"
-    if normalized in {"n", "n_mg_l"} or re.search(r"nitrogen|�", raw, re.I):
+    if normalized in {"n", "n_mg_l"} or re.search(r"nitrogen|氮", raw, re.I):
         return "nitrogen"
-    if normalized in {"p", "p_mg_l"} or re.search(r"phosphorus|�", raw, re.I):
+    if normalized in {"p", "p_mg_l"} or re.search(r"phosphorus|磷", raw, re.I):
         return "phosphorus"
     if normalized in {"tf"}:
         return "tf"
@@ -88,11 +88,11 @@ def infer_column_role(name: str) -> str:
         return "temperature"
     if normalized in {"ph"} or re.search(r"\bpH\b", name or ""):
         return "ph"
-    if "co2" in normalized or "co�" in raw:
+    if "co2" in normalized or "co₂" in raw:
         return "co2"
     if "od750" in normalized or normalized == "od":
         return "od"
-    if "biomass" in normalized or "生物�" in raw:
+    if "biomass" in normalized or "生物量" in raw:
         return "biomass"
     return "unknown"
 
@@ -104,7 +104,7 @@ def extract_unit(name: str) -> str | None:
     if match:
         return match.group(1)
     if "μmol" in name or "µmol" in name:
-        return "μmol·m�?·s�?"
+        return "μmol·m⁻²·s⁻¹"
     return None
 
 

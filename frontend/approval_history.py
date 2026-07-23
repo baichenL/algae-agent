@@ -1,5 +1,5 @@
 # frontend/approval_history.py 负责渲染审批历史内容
-import requests
+from frontend.http import get_pending_list
 
 STATUS_OPTIONS = {
     "全部": "all",
@@ -10,11 +10,7 @@ STATUS_OPTIONS = {
 
 
 def _load_approval_items(backend_url: str, status: str) -> list[dict]:
-    response = requests.get(
-        f"{backend_url}/api/v1/strain/pending",
-        params={"status": status},
-        timeout=10,
-    )
+    response = get_pending_list(backend_url, timeout=10, status=status)
     if response.status_code != 200:
         raise RuntimeError(response.text)
     return response.json().get("pending", [])

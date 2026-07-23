@@ -1,0 +1,26 @@
+# Optional source mounts for local development. The default Compose file keeps
+# application code immutable inside the image.
+services:
+  algae-agent:
+    # Existing bind-mounted SQLite files may have been created by an older
+    # root-running image. Windows Docker Desktop preserves that Linux owner,
+    # so use a development-only identity override. Production stays non-root.
+    user: "${ALGAE_DEV_UID:-0}:${ALGAE_DEV_GID:-0}"
+    # The base service drops every Linux capability. Re-add only the two needed
+    # to update legacy SQLite/WAL files that were created under mixed UIDs.
+    cap_add:
+      - DAC_OVERRIDE
+      - FOWNER
+    volumes:
+      - type: bind
+        source: ./app
+        target: /app/app
+      - type: bind
+        source: ./data
+        target: /app/data
+
+  algae-frontend:
+    volumes:
+      - type: bind
+        source: ./frontend
+        target: /app/frontend

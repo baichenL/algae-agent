@@ -164,10 +164,10 @@ def _compact_background_evidence(evidence: list[EvidenceUnit], limit: int = 3) -
 
 def _missing_aspect_label(aspect: str) -> str:
     return {
-        "subject": "瀵硅薄",
-        "condition": "鏉′欢",
-        "relation": "鏄庣‘鍏崇郴",
-        "target": "鐩爣",
+        "subject": "对象",
+        "condition": "条件",
+        "relation": "明确关系",
+        "target": "目标",
     }.get(aspect, aspect)
 
 
@@ -179,15 +179,15 @@ def _display_entity_name(value: str) -> str:
 def _has_local_usage_context(item: EvidenceUnit, target: str) -> bool:
     text = item.text_span or item.value or ""
     target_terms = [term for term in re.split(r"\s+", target.casefold()) if term]
-    for segment in re.split(r"[銆傦紒锟??锟?\n]", text):
+    for segment in re.split(r"[。！？!?\n]", text):
         lower = segment.casefold()
         if "tap" not in lower:
             continue
         if not all(term in lower for term in target_terms):
             continue
-        if re.search(r"but\s+no|no\s+(?:direct\s+)?(?:statement|evidence)|not\s+suitable|娌℃湁.*(?:璇佹嵁|璇存槑)|涓嶈兘璇佹槑", segment, re.I):
+        if re.search(r"but\s+no|no\s+(?:direct\s+)?(?:statement|evidence)|not\s+suitable|没有.*(?:证据|说明)|不能证明", segment, re.I):
             continue
-        if re.search(r"鐢ㄤ簬|浣跨敤|鍩瑰吇|閰嶅埗|used?\s+(?:in|for)|cultivated?\s+(?:in|under)", segment, re.I):
+        if re.search(r"用于|使用|培养|配制|used?\s+(?:in|for)|cultivated?\s+(?:in|under)", segment, re.I):
             return True
     return False
 
@@ -205,7 +205,7 @@ def _compose_table_schema_answer(
 
     if frame.answer_shape == "list":
         selected = table_columns
-        label = "??"
+        label = "字段"
         if frame.target_attribute == "environment_variables":
             selected = [
                 item

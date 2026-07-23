@@ -115,7 +115,8 @@ def active_vector_backend() -> str:
 
 
 def _embed_openai_compatible(texts: list[str], config: EmbeddingConfig) -> list[list[float]]:
-    client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+    timeout_seconds = max(float(os.getenv("RAG_EMBEDDING_TIMEOUT_SECONDS", "20")), 1.0)
+    client = OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=timeout_seconds, max_retries=0)
     vectors: list[list[float]] = []
     for start in range(0, len(texts), config.batch_size):
         batch = texts[start : start + config.batch_size]
@@ -133,6 +134,8 @@ def _embed_openai_compatible(texts: list[str], config: EmbeddingConfig) -> list[
 
 
 def _embedding_text(chunk: dict) -> str:
+    if str(chunk.get("index_text") or "").strip():
+        return str(chunk["index_text"]).strip()
     metadata = chunk.get("metadata") or {}
     return "\n".join(
         str(item or "")

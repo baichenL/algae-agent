@@ -89,33 +89,33 @@ def normalize_recipe_group(name: str | None) -> str | None:
 
 def prettify_component_name(text: str) -> str:
     replacements = {
-        "(NH4)6Mo7O24?4H2O": "(NH\u2084)\u2086Mo\u2087O\u2082\u2084\u00b74H\u2082O",
+        "(NH4)6Mo7O24·4H2O": "(NH\u2084)\u2086Mo\u2087O\u2082\u2084\u00b74H\u2082O",
         "(NH4)6Mo7O24": "(NH\u2084)\u2086Mo\u2087O\u2082\u2084",
         "Na2-EDTA2H2O": "Na\u2082-EDTA\u00b72H\u2082O",
         "MgSO4 7H2O": "MgSO\u2084\u00b77H\u2082O",
-        "MgSO4?7H2O": "MgSO\u2084\u00b77H\u2082O",
+        "MgSO4·7H2O": "MgSO\u2084\u00b77H\u2082O",
         "CaCl2 2H2O": "CaCl\u2082\u00b72H\u2082O",
-        "CaCl2?2H2O": "CaCl\u2082\u00b72H\u2082O",
+        "CaCl2·2H2O": "CaCl\u2082\u00b72H\u2082O",
         "ZnSO4 7H2O": "ZnSO\u2084\u00b77H\u2082O",
         "FeSO4 7H2O": "FeSO\u2084\u00b77H\u2082O",
         "MnCl2 4H2O": "MnCl\u2082\u00b74H\u2082O",
         "CoCl2 6H2O": "CoCl\u2082\u00b76H\u2082O",
         "CuSO4 5H2O": "CuSO\u2084\u00b75H\u2082O",
         "K2HPO4": "K\u2082HPO\u2084",
-        "K?HPO?": "K\u2082HPO\u2084",
+        "K₂HPO₄": "K\u2082HPO\u2084",
         "KH2PO4": "KH\u2082PO\u2084",
-        "KH?PO?": "KH\u2082PO\u2084",
+        "KH₂PO₄": "KH\u2082PO\u2084",
         "NH4Cl": "NH\u2084Cl",
-        "NH?Cl": "NH\u2084Cl",
+        "NH₄Cl": "NH\u2084Cl",
         "H3BO3": "H\u2083BO\u2083",
-        "H?BO?": "H\u2083BO\u2083",
+        "H₃BO₃": "H\u2083BO\u2083",
         "H2O": "H\u2082O",
-        "H?O": "H\u2082O",
-        "Hutner?s": "Hutner's",
+        "H₂O": "H\u2082O",
+        "Hutner’s": "Hutner's",
         "Tris(sigma)": "Tris",
-        "(??1)": "???1?",
-        "(??2)": "???2?",
-        "(??3)": "???3?",
+        "（母液1）": "母液1",
+        "（母液2）": "母液2",
+        "（母液3）": "母液3",
     }
     formatted = str(text)
     for raw, pretty in replacements.items():
@@ -202,7 +202,7 @@ def _unit_for_table(table_index: int, amount_text: str) -> str | None:
     text = amount_text.strip()
     if re.search(r"\bml\b|mL|升|l\b", text, re.I):
         return "mL"
-    if re.search(r"\bg\b|�", text, re.I):
+    if re.search(r"\bg\b|克", text, re.I):
         return "g"
     if table_index in {1, 2, 3} and _parse_amount(text) is not None:
         return "g"

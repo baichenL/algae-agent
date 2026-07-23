@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from typing import Protocol
 
 from app.models.rag_retrieval_schema import RetrievalHit, RetrievalQuery
@@ -25,6 +27,11 @@ DOC_TYPE_BOOST = {
 DEFAULT_BGE_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_MAX_PASSAGE_CHARS = 2400
 DEFAULT_CALIBRATION_MAX_DELTA = 0.05
+DEFAULT_LOAD_COOLDOWN_SECONDS = 300
+
+_RERANKER_LOCK = threading.Lock()
+_BGE_SINGLETON: "BgeReranker | None" = None
+_ACTIVE_RERANKER: "Reranker | None" = None
 
 
 class Reranker(Protocol):
@@ -64,6 +71,14 @@ class DeterministicFakeReranker:
                 update={
                     "rerank_score": float(len(set(_terms(query.original_query)) & set(_terms(hit.content)))),
                     "final_rank": index,
+                    "metadata": {
+                        **hit.metadata,
+                        "rerank_components": {
+                            "backend": "fake",
+                            "term_overlap": len(set(_terms(query.original_query)) & set(_terms(hit.content))),
+                            "total": float(len(set(_terms(query.original_query)) & set(_terms(hit.content)))),
+                        },
+                    },
                 }
             )
             for index, hit in enumerate(ranked, start=1)
@@ -102,6 +117,7 @@ class BgeReranker:
         self.max_passage_chars = max(int(os.getenv("RAG_RERANKER_MAX_PASSAGE_CHARS", str(DEFAULT_MAX_PASSAGE_CHARS))), 400)
         self._model = None
         self._load_error: str | None = None
+        self._load_error_at: float | None = None
 
     def rerank(self, query: RetrievalQuery, hits: list[RetrievalHit]) -> list[RetrievalHit]:
         if not hits:
@@ -144,14 +160,23 @@ class BgeReranker:
     def _load_model(self):
         if self._model is not None:
             return self._model
+        cooldown = max(int(os.getenv("RAG_RERANKER_LOAD_COOLDOWN_SECONDS", str(DEFAULT_LOAD_COOLDOWN_SECONDS))), 1)
+        if self._load_error_at and time.monotonic() - self._load_error_at < cooldown:
+            raise ParserlessRerankerUnavailable(self._load_error or "reranker_load_cooldown")
         try:
+            if os.getenv("RAG_BGE_LOCAL_FILES_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}:
+                os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
             from FlagEmbedding import FlagReranker
 
-            use_fp16 = os.getenv("RAG_BGE_RERANKER_USE_FP16", "true").strip().lower() in {"1", "true", "yes", "on"}
+            use_fp16 = _cuda_available() and os.getenv("RAG_BGE_RERANKER_USE_FP16", "true").strip().lower() in {"1", "true", "yes", "on"}
             self._model = FlagReranker(self.model_name, use_fp16=use_fp16)
+            self._load_error = None
+            self._load_error_at = None
             return self._model
         except Exception as exc:
             self._load_error = str(exc)
+            self._load_error_at = time.monotonic()
             if _strict_mode():
                 raise RuntimeError(f"BGE reranker is required for this query but unavailable: {exc}") from exc
             raise ParserlessRerankerUnavailable(str(exc)) from exc
@@ -233,6 +258,7 @@ def rerank_chunks(question: str, candidates: list[dict], top_k: int) -> list[dic
 
 
 def get_reranker() -> Reranker:
+    global _ACTIVE_RERANKER
     if os.getenv("RAG_RERANKER_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "on"}:
         return NoOpReranker()
     backend = os.getenv("RAG_RERANKER_BACKEND", "bge_calibrated").strip().lower()
@@ -241,17 +267,69 @@ def get_reranker() -> Reranker:
     if backend == "fake":
         return DeterministicFakeReranker()
     if backend in {"bge", "bge_calibrated", "bge_business", "bge_business_calibration"}:
-        bge = BgeReranker()
-        try:
-            bge._load_model()
-            if backend == "bge":
-                return bge
-            return BusinessCalibrationReranker(bge)
-        except ParserlessRerankerUnavailable as exc:
-            if backend == "bge":
-                return BusinessCalibrationReranker(None, degraded_reason=f"bge_unavailable:{exc}")
-            return BusinessCalibrationReranker(None, degraded_reason=f"bge_unavailable:{exc}")
+        if _ACTIVE_RERANKER is not None:
+            return _ACTIVE_RERANKER
+        bge = _bge_singleton()
+        if bge._model is not None:
+            _ACTIVE_RERANKER = bge if backend == "bge" else BusinessCalibrationReranker(bge)
+            return _ACTIVE_RERANKER
+        reason = bge._load_error or "bge_not_prewarmed"
+        if _strict_mode():
+            raise RuntimeError(f"BGE reranker is required but unavailable: {reason}")
+        return BusinessCalibrationReranker(None, degraded_reason=reason)
     return RuleBasedReranker()
+
+
+def prewarm_reranker() -> dict:
+    """Load the local model once during application startup, never on a user query."""
+    global _ACTIVE_RERANKER
+    if os.getenv("RAG_RERANKER_PREWARM_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        return reranker_runtime_status(reason="prewarm_disabled")
+    backend = os.getenv("RAG_RERANKER_BACKEND", "bge_calibrated").strip().lower()
+    if backend not in {"bge", "bge_calibrated", "bge_business", "bge_business_calibration"}:
+        _ACTIVE_RERANKER = get_reranker()
+        return reranker_runtime_status()
+    bge = _bge_singleton()
+    try:
+        bge._load_model()
+        _ACTIVE_RERANKER = bge if backend == "bge" else BusinessCalibrationReranker(bge)
+    except ParserlessRerankerUnavailable:
+        _ACTIVE_RERANKER = None
+    return reranker_runtime_status()
+
+
+def reranker_runtime_status(*, reason: str | None = None) -> dict:
+    backend = os.getenv("RAG_RERANKER_BACKEND", "bge_calibrated").strip().lower()
+    if backend not in {"bge", "bge_calibrated", "bge_business", "bge_business_calibration"}:
+        return {"status": "ready", "backend": backend, "model": None, "degraded": False, "reason": reason}
+    bge = _bge_singleton()
+    ready = bge._model is not None
+    return {
+        "status": "ready" if ready else "degraded",
+        "backend": backend,
+        "model": bge.model_name,
+        "degraded": not ready,
+        "reason": reason or bge._load_error or "bge_not_prewarmed",
+        "cooldown_active": bool(bge._load_error_at),
+    }
+
+
+def _bge_singleton() -> BgeReranker:
+    global _BGE_SINGLETON
+    if _BGE_SINGLETON is None:
+        with _RERANKER_LOCK:
+            if _BGE_SINGLETON is None:
+                _BGE_SINGLETON = BgeReranker()
+    return _BGE_SINGLETON
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def _chunk_to_hit(chunk: dict) -> RetrievalHit:

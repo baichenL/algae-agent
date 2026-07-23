@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 
@@ -26,6 +26,8 @@ from app.core.db import operations
 from app.services.chat.legacy_task_migration import import_legacy_task_states
 from app.services.user_memory.migration import import_legacy_user_memories
 from app.services.user_memory.curator import curate_all_user_memories
+from app.services.rag.retrieval.reranker import prewarm_reranker, reranker_runtime_status
+from app.core.db.connection import connect
 
 
 @asynccontextmanager
@@ -40,6 +42,11 @@ async def lifespan(app: FastAPI):
     await recover_approved_executions()
     await cleanup_agent_runtime_checkpoints(retention_days=7, max_completed_threads=500)
     database.cleanup_completed_resume_jobs(older_than=time_days_ago(7))
+
+    try:
+        app.state.rag_reranker = await asyncio.wait_for(asyncio.to_thread(prewarm_reranker), timeout=60)
+    except asyncio.TimeoutError:
+        app.state.rag_reranker = reranker_runtime_status(reason="prewarm_timeout_60s")
 
     monitor_task = asyncio.create_task(daily_schedule_monitor())
     scheduler_task = asyncio.create_task(email_scheduler_loop())
@@ -62,6 +69,39 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+
+@app.get("/health/live", include_in_schema=False)
+async def health_live():
+    """Process liveness probe; intentionally does not depend on optional services."""
+    return {"status": "ok"}
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready():
+    """Readiness probe for the database and configured RAG reranker."""
+    checks: dict[str, dict] = {}
+    ready = True
+
+    try:
+        with connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+        checks["database"] = {"status": "ready"}
+    except Exception as exc:
+        ready = False
+        checks["database"] = {"status": "unavailable", "reason": type(exc).__name__}
+
+    reranker_enabled = os.getenv("RAG_RERANKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    if reranker_enabled:
+        reranker = reranker_runtime_status()
+        checks["reranker"] = reranker
+        if reranker.get("status") != "ready":
+            ready = False
+    else:
+        checks["reranker"] = {"status": "disabled"}
+
+    payload = {"status": "ready" if ready else "not_ready", "checks": checks}
+    return JSONResponse(status_code=200 if ready else 503, content=payload)
 
 app.add_middleware(
     CORSMiddleware,

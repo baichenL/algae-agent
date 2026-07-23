@@ -1,12 +1,23 @@
-from typing import Any, List, Optional
+from datetime import datetime
+from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class RagQueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
-    top_k: int = 5
+    top_k: int = Field(default=5, ge=1, le=20)
     doc_types: List[str] = Field(default_factory=list)
+    retrieval_mode: Literal["auto", "simple", "agentic"] = "auto"
+    source_ids: List[str] = Field(default_factory=list)
+    version_policy: Literal["current", "all", "as_of"] = "current"
+    as_of: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_version_policy(self):
+        if self.version_policy == "as_of" and self.as_of is None:
+            raise ValueError("as_of is required when version_policy='as_of'")
+        return self
 
 
 class RagCitation(BaseModel):
@@ -33,6 +44,17 @@ class RagCitation(BaseModel):
     task_type: Optional[str] = None
     equipment: Optional[str] = None
     measurement: Optional[str] = None
+    knowledge_source_id: Optional[str] = None
+    generation_id: Optional[str] = None
+    evidence_id: Optional[str] = None
+    document_version: Optional[str] = None
+    content_hash: Optional[str] = None
+    source_locator: dict[str, Any] = Field(default_factory=dict)
+
+
+class RagGenerationCreateRequest(BaseModel):
+    generation_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]{1,100}$")
+    source_roots: List[str] = Field(default_factory=list)
 
 
 class RagEvidence(BaseModel):

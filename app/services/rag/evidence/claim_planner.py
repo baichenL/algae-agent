@@ -9,11 +9,11 @@ def build_claim_plan(
     evidence_ids = [item.evidence_id for item in answer.evidence]
     if answer.answerability.status == "answered":
         if len(answer.evidence) == 1:
-            sentences = [item.strip() for item in answer.direct_answer.split("�") if item.strip()]
+            sentences = [item.strip() for item in answer.direct_answer.split("。") if item.strip()]
             claims = [
                 GroundedClaim(
                     claim_type="fact",
-                    text=f"{sentences[0]}�" if sentences else answer.direct_answer,
+                    text=f"{sentences[0]}。" if sentences else answer.direct_answer,
                     evidence_ids=evidence_ids,
                 )
             ]
@@ -21,7 +21,7 @@ def build_claim_plan(
                 claims.append(
                     GroundedClaim(
                         claim_type="explanation",
-                        text="�".join(sentences[1:]) + "�",
+                        text="。".join(sentences[1:]) + "。",
                         evidence_ids=evidence_ids,
                     )
                 )

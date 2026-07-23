@@ -1,43 +1,61 @@
 services:
   algae-agent:
-    build: .
-    image: algae-agent
-    container_name: algae_agent_app
+    build:
+      context: .
+      args:
+        RAG_BGE_MODEL_ID: "${RAG_BGE_MODEL_ID:-BAAI/bge-reranker-v2-m3}"
+        RAG_BGE_MODEL_REVISION: "${RAG_BGE_MODEL_REVISION:-953dc6f}"
+    image: "algae-agent:${ALGAE_IMAGE_TAG:-local}"
     env_file: .env
+    environment:
+      # The image always uses its baked, container-local model. This intentionally
+      # overrides host-only paths that may be present in .env for local Python runs.
+      RAG_BGE_RERANKER_MODEL: /opt/models/bge-reranker-v2-m3
+      RAG_BGE_LOCAL_FILES_ONLY: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     ports:
-      - "${ALGAE_AGENT_PORT:-8000}:8000"
+      - "${ALGAE_BIND_HOST:-127.0.0.1}:${ALGAE_AGENT_PORT:-8000}:8000"
+    init: true
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=2)"
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 10s
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 75s
     volumes:
-      - type: bind
-        source: ./app
-        target: /app/app
-      - type: bind
-        source: ./data
+      - type: volume
+        source: algae-data
         target: /app/data
 
   algae-frontend:
-    image: algae-agent
-    container_name: algae_agent_frontend
+    image: "algae-agent:${ALGAE_IMAGE_TAG:-local}"
+    pull_policy: never
     depends_on:
       algae-agent:
         condition: service_healthy
+    init: true
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       BACKEND_URL: http://algae-agent:8000
+      ALGAE_FRONTEND_API_KEY: "${ALGAE_FRONTEND_API_KEY:?Set ALGAE_FRONTEND_API_KEY in .env to a configured API key}"
+      HOME: /tmp
     ports:
-      - "${ALGAE_FRONTEND_PORT:-8501}:8501"
+      - "${ALGAE_BIND_HOST:-127.0.0.1}:${ALGAE_FRONTEND_PORT:-8501}:8501"
     command: ["streamlit", "run", "frontend/app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
-    volumes:
-      - type: bind
-        source: ./frontend
-        target: /app/frontend
+
+volumes:
+  algae-data:

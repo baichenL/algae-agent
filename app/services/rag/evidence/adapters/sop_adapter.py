@@ -73,14 +73,14 @@ def _facts_from_text(source: Path, unit, document_id: int) -> list[dict]:
     text = unit.content or ""
     facts = []
     fact_specs = [
-        ("tap_medium", "operation", "TAP 液体培养基配�", r"1\.2\.4\s*TAP|TAP 液体培养�"),
-        ("hygromycin_tap_plate", "material_used", "潮霉�?TAP 平板用于转化后筛�", r"潮霉素\s*TAP\s*平板|hygromycin\s*TAP"),
-        ("sucrose_tap_medium", "material_used", "40 mM 蔗糖 TAP 培养基用于电击转化相关操�", r"蔗糖\s*TAP\s*培养基|40\s*mM.*TAP"),
-        ("electroporation", "parameter", "莱茵衣藻培养�?OD750=0.3-0.5 后用于电击转化材料准�", r"OD750\s*=\s*0\.3-0\.5"),
+        ("tap_medium", "operation", "TAP 液体培养基配制", r"1\.2\.4\s*TAP|TAP 液体培养基"),
+        ("hygromycin_tap_plate", "material_used", "潮霉素 TAP 平板用于转化后筛选", r"潮霉素\s*TAP\s*平板|hygromycin\s*TAP"),
+        ("sucrose_tap_medium", "material_used", "40 mM 蔗糖 TAP 培养基用于电击转化相关操作", r"蔗糖\s*TAP\s*培养基|40\s*mM.*TAP"),
+        ("electroporation", "parameter", "莱茵衣藻培养至 OD750=0.3-0.5 后用于电击转化材料准备", r"OD750\s*=\s*0\.3-0\.5"),
         (
             "recovery_culture",
             "procedure_step",
-            "使用蔗糖 TAP 溶液重悬或进行恢复培�",
+            "使用蔗糖 TAP 溶液重悬或进行恢复培养",
             r"蔗糖\s*TAP\s*溶液重悬|TAP.{0,100}恢复培养|恢复培养.{0,100}TAP",
         ),
     ]

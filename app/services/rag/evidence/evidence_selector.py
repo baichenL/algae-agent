@@ -167,7 +167,7 @@ def _select_with_type_coverage(
 
 
 def _terms(text: str) -> set[str]:
-    raw = str(text or "").lower().replace("�", "u").replace("�", "u")
+    raw = str(text or "").lower().replace("μ", "u").replace("µ", "u")
     return {
         item.strip("_-+")
         for item in re.findall(r"[a-z0-9_+\-]+|[\u4e00-\u9fff]{2,}", raw)

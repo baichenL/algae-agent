@@ -14,6 +14,7 @@ from app.services.context import (
     model_call_metrics,
 )
 from app.services.rag.citations import format_rag_citation
+from app.services.rag.query_normalizer import infer_rag_doc_types as infer_normalized_rag_doc_types
 from app.services.rag.service import answer_rag_question
 
 
@@ -233,31 +234,7 @@ def _build_model_fallback_reply(
 
 
 def infer_rag_doc_types(message: str) -> list[str]:
-    text = (message or "").lower()
-    doc_types: list[str] = []
-
-    # Keep legacy mojibake keywords for old regression fixtures; real UTF-8
-    # Chinese terms live alongside them so current user input remains readable.
-    manual_query = _contains_any(text, ["瀹為獙鎵嬪唽", "鎵嬪唽", "sop", "protocol", "manual", "鎿嶄綔", "姝ラ"])
-    recipe_query = _contains_any(
-        text,
-        ["tap", "培养基", "配方", "组分", "成分", "组成", "medium", "recipe", "composition"],
-    )
-
-    if manual_query:
-        doc_types.extend(["manual", "media_recipe"])
-    elif recipe_query:
-        doc_types.extend(["media_recipe", "manual"])
-    if _contains_any(text, ["璁烘枃", "paper", "鏂囩尞", "literature", "machine learning", "microalgae cultivation"]):
-        doc_types.append("paper")
-    if _contains_any(text, ["od750", "growth curve", "鐢熼暱鏇茬嚎", "瀹為獙鏁版嵁", "鏁版嵁"]):
-        doc_types.extend(["experiment_data", "manual", "paper"])
-
-    deduped = []
-    for item in doc_types:
-        if item not in deduped:
-            deduped.append(item)
-    return deduped
+    return infer_normalized_rag_doc_types(message)
 
 
 def _format_rag_reply(rag_response) -> str:

@@ -3,7 +3,12 @@
 import time
 import uuid
 
-from app.core.database import insert_rag_query_log, insert_rag_retrieval_trace_rows, insert_rag_trace_log
+from app.core.database import (
+    get_active_rag_generation_id,
+    insert_rag_query_log,
+    insert_rag_retrieval_trace_rows,
+    insert_rag_trace_log,
+)
 from app.models.rag_schema import (
     RagAnswer,
     RagAnswerSegment,
@@ -20,6 +25,9 @@ from app.services.rag.evidence.evidence_sufficiency import assess_evidence_suffi
 from app.services.rag.evidence.kernel import answer_with_evidence_kernel
 from app.services.rag.evidence.query_frame import parse_query_frame
 from app.services.rag.evidence.query_understanding import parse_question_aspects
+from app.services.rag.agentic import retrieve_with_budget, select_retrieval_mode
+from app.services.rag.query_normalizer import normalize_rag_query
+from app.services.rag.versioning import find_version_conflicts
 
 
 BLOCKED_KEYWORDS = [
@@ -62,6 +70,9 @@ def answer_rag_question(request: RagQueryRequest) -> RagQueryResponse:
     started_at = time.perf_counter()
     trace_id = f"rag:{uuid.uuid4().hex}"
     question = request.question.strip()
+    normalized_query = normalize_rag_query(question)
+    retrieval_mode = select_retrieval_mode(question, request.retrieval_mode)
+    generation_id = get_active_rag_generation_id()
     blocked_reason = _blocked_reason(question)
     if blocked_reason:
         # RAG is the knowledge layer; execution, approval, writes, and email stay in controlled tools/workflows.
@@ -85,10 +96,36 @@ def answer_rag_question(request: RagQueryRequest) -> RagQueryResponse:
             blocked=True,
             blocked_reason=blocked_reason,
             query_log_id=query_log_id,
-            debug={"trace_id": trace_id},
+            debug={
+                "trace_id": trace_id, "active_generation": generation_id,
+                "normalized_query": normalized_query.model_dump(), "retrieval_mode": retrieval_mode,
+            },
+        )
+
+    conflicts = find_version_conflicts(
+        doc_types=request.doc_types or normalized_query.doc_types or None,
+        source_ids=request.source_ids or None,
+        version_policy=request.version_policy,
+        as_of=request.as_of,
+    )
+    if conflicts:
+        query_log_id = insert_rag_query_log(
+            question=question, answer=None, citations=[],
+            uncertainty=["Multiple effective versions exist for the same knowledge asset."],
+            blocked_reason="version_conflict",
+        )
+        return RagQueryResponse(
+            status="conflicted", blocked=False, blocked_reason="version_conflict", query_log_id=query_log_id,
+            debug={
+                "trace_id": trace_id, "active_generation": generation_id,
+                "normalized_query": normalized_query.model_dump(), "retrieval_mode": retrieval_mode,
+                "version_conflicts": conflicts,
+            },
         )
 
     try:
+        # Structured evidence remains authoritative in every mode. Questions it
+        # cannot answer fall through to the budgeted agentic retriever.
         m2_response = answer_with_evidence_kernel(
             question,
             top_k=request.top_k,
@@ -108,7 +145,16 @@ def answer_rag_question(request: RagQueryRequest) -> RagQueryResponse:
     if m2_response:
         response = _build_response_from_m2(question, m2_response)
         _record_rag_trace(trace_id, question, "evidence_kernel", response, m2_response.debug or {}, started_at)
-        response.debug = {**(response.debug or {}), "trace_id": trace_id}
+        response.debug = {
+            **(response.debug or {}), "trace_id": trace_id, "active_generation": generation_id,
+            "normalized_query": normalized_query.model_dump(), "retrieval_mode": retrieval_mode,
+            "agentic": {
+                "mode": retrieval_mode,
+                "rounds": 1 if retrieval_mode == "agentic" else 0,
+                "retrieval_calls": 1 + int(bool((m2_response.debug or {}).get("agentic_verification_retry"))),
+                "stop_reason": "structured_evidence_kernel",
+            } if retrieval_mode == "agentic" else None,
+        }
         return response
 
     requested_top_k = max(int(request.top_k or 5), 1)
@@ -121,7 +167,27 @@ def answer_rag_question(request: RagQueryRequest) -> RagQueryResponse:
     ):
         retrieval_top_k = max(requested_top_k * 3, 12)
     try:
-        chunks = retrieve_chunks(question, top_k=retrieval_top_k, doc_types=request.doc_types or None)
+        metadata_filters = {
+            "source_ids": request.source_ids,
+            "version_policy": request.version_policy,
+            "as_of": request.as_of.isoformat() if request.as_of else None,
+        }
+        agentic_debug = None
+        if retrieval_mode == "agentic":
+            agentic_result = retrieve_with_budget(
+                question, top_k=retrieval_top_k, doc_types=request.doc_types or None,
+                metadata_filters=metadata_filters,
+            )
+            chunks = agentic_result.chunks
+            agentic_debug = agentic_result.debug
+            if chunks and not any("vector" in (chunk.get("retrieval_channels") or []) for chunk in chunks):
+                agentic_debug["stop_reason"] = "insufficient_without_dense_retrieval"
+                chunks = []
+        else:
+            chunks = retrieve_chunks(
+                question, top_k=retrieval_top_k, doc_types=request.doc_types or None,
+                metadata_filters=metadata_filters,
+            )
         chunks = _select_answer_chunks(question, chunks, requested_top_k)
         if _should_reject_low_relevance_chunks(question, chunks):
             chunks = []
@@ -165,12 +231,34 @@ def answer_rag_question(request: RagQueryRequest) -> RagQueryResponse:
         "retrieved_ids": [chunk.get("chunk_id") for chunk in chunks if chunk.get("chunk_id")],
         "reranked_ids": [chunk.get("chunk_id") for chunk in chunks if chunk.get("chunk_id")],
         "retrieval_hit_trace": [
-            chunk.get("retrieval_hit")
-            for chunk in chunks
-            if chunk.get("retrieval_hit")
+            *(
+                ((chunks[0].get("retrieval_trace") or {}).get("candidates") or [])
+                if chunks and chunks[0].get("retrieval_trace")
+                else [chunk.get("retrieval_hit") for chunk in chunks if chunk.get("retrieval_hit")]
+            )
         ],
+        "active_generation": generation_id,
+        "normalized_query": normalized_query.model_dump(),
+        "retrieval_mode": retrieval_mode,
+        "agentic": agentic_debug,
+        "retrieval_degraded": any(bool(chunk.get("retrieval_degraded")) for chunk in chunks),
+        "degraded_reasons": sorted({reason for chunk in chunks for reason in (chunk.get("retrieval_degraded_reasons") or [])}),
+        "retrieval_timings_ms": (
+            (chunks[0].get("retrieval_trace") or {}).get("timings_ms", {}) if chunks else {}
+        ),
     }
     answer = enrich_controlled_answer(question, answer, citations)
+    cited_ids = {citation.source_id for citation in citations}
+    evidence_ids = {item.source_id for item in answer.evidence}
+    citation_validation = {
+        "valid": bool(not answer.evidence or evidence_ids.issubset(cited_ids)),
+        "claim_count": len(answer.facts) + len(answer.explanations) + len(answer.suggestions),
+        "cited_evidence_count": len(evidence_ids & cited_ids),
+        "uncited_evidence_ids": sorted(evidence_ids - cited_ids),
+    }
+    answer.debug["citation_validation"] = citation_validation
+    if not citation_validation["valid"]:
+        answer.uncertainty.append("Some factual evidence could not be bound to a citation; treat the answer as partial.")
     query_log_id = insert_rag_query_log(
         question=question,
         answer=answer.model_dump_json(),
@@ -185,7 +273,11 @@ def answer_rag_question(request: RagQueryRequest) -> RagQueryResponse:
         query_log_id=query_log_id,
     )
     _record_rag_trace(trace_id, question, "m1_fallback", response, answer.debug or {}, started_at)
-    response.debug = {**(response.debug or {}), "trace_id": trace_id}
+    response.debug = {
+        **(response.debug or {}), "trace_id": trace_id, "active_generation": generation_id,
+        "normalized_query": normalized_query.model_dump(), "retrieval_mode": retrieval_mode,
+        "agentic": agentic_debug,
+    }
     return response
 
 
@@ -251,7 +343,7 @@ def _record_retrieval_hit_trace(trace_id: str, response: RagQueryResponse) -> No
     for hit in (response.answer.debug or {}).get("retrieval_hit_trace") or []:
         rows.append(
             {
-                "stage": "selected",
+                "stage": "selected" if hit.get("selected") else "rejected",
                 "evidence_id": hit.get("evidence_id"),
                 "document_id": hit.get("document_id"),
                 "rank": hit.get("final_rank"),
@@ -259,9 +351,12 @@ def _record_retrieval_hit_trace(trace_id: str, response: RagQueryResponse) -> No
                 "dense_score": hit.get("dense_score"),
                 "fusion_score": hit.get("fusion_score"),
                 "rerank_score": hit.get("rerank_score"),
-                "selected": True,
+                "selected": bool(hit.get("selected", True)),
                 "rejection_reason": hit.get("rejection_reason"),
-                "metadata": hit.get("metadata") or {},
+                "metadata": {
+                    **(hit.get("metadata") or {}),
+                    "model_versions": hit.get("model_versions") or {},
+                },
             }
         )
     for item in response.answer.evidence:
@@ -403,47 +498,47 @@ def _format_evidence_presentation_summary(
 def _background_support_phrase(raw_text: str, doc_type: str) -> str:
     text = raw_text or ""
     lower = text.lower()
-    if "tap" in lower and ("sucrose" in lower or "??" in text):
-        if "recovery" in lower or "??" in text:
-            return "????? 40 mM ?? TAP ????????????"
-        return "????? 40 mM ?? TAP ???"
-    if "tap" in lower and ("hygromycin" in lower or "???" in text):
-        return "???????? TAP ??????????"
+    if "tap" in lower and ("sucrose" in lower or "蔗糖" in text):
+        if "recovery" in lower or "恢复" in text:
+            return "资料提到使用 40 mM 蔗糖 TAP 进行转化后的恢复培养"
+        return "资料提到使用 40 mM 蔗糖 TAP 培养基"
+    if "tap" in lower and ("hygromycin" in lower or "潮霉素" in text):
+        return "资料提到潮霉素 TAP 平板用于转化后筛选"
     if "tap" in lower and doc_type == "media_recipe":
-        return "????? TAP ???????????"
+        return "资料给出了 TAP 培养基的组成或配制信息"
     if "tap" in lower:
-        return "????? TAP ???? TAP ??????"
+        return "资料提到 TAP 培养基或与 TAP 相关的操作"
     return _summarize_content(text, max_length=90)
 
 
 def _format_missing_aspects(missing_aspects: list[str], aspects: dict) -> str:
     if not missing_aspects:
-        return "?????????????????"
+        return "直接结论所需的关键条件或关系"
     labels = []
     for item in missing_aspects:
         labels.append(_aspect_label(item, aspects))
-    return "?".join(label for label in labels if label)
+    return "、".join(label for label in labels if label)
 
 
 def _aspect_label(aspect: str, aspects: dict) -> str:
     if aspect == "subject":
-        return f"???{aspects.get('subject') or '????'}"
+        return f"研究对象：{aspects.get('subject') or '未明确'}"
     if aspect == "condition":
-        condition = aspects.get("condition") or "????"
+        condition = aspects.get("condition") or "未明确"
         if condition == "dark culture":
-            condition = "????"
-        return f"???{condition}"
+            condition = "黑暗培养"
+        return f"条件：{condition}"
     if aspect == "relation":
-        relation = aspects.get("relation") or "????"
+        relation = aspects.get("relation") or "未明确"
         labels = {
-            "suitability": "????",
-            "support": "????",
-            "migration": "??/????",
-            "relationship": "?????",
+            "suitability": "适用性",
+            "support": "证据支持",
+            "migration": "迁移或直接套用",
+            "relationship": "关系或影响",
         }
         return labels.get(relation, relation)
     if aspect == "target":
-        return f"???{aspects.get('target') or '??'}"
+        return f"目标：{aspects.get('target') or '未明确'}"
     return aspect
 
 
@@ -534,6 +629,12 @@ def _build_response_from_m2(question: str, grounded_answer) -> RagQueryResponse:
                     task_type=item.metadata.get("task_type"),
                     equipment=item.metadata.get("equipment"),
                     measurement=item.metadata.get("measurement"),
+                    knowledge_source_id=item.source_id or citation_payload.get("knowledge_source_id"),
+                    generation_id=item.metadata.get("generation_id") or citation_payload.get("generation_id"),
+                    evidence_id=item.evidence_id,
+                    document_version=item.document_version or citation_payload.get("document_version"),
+                    content_hash=item.content_hash or citation_payload.get("content_hash"),
+                    source_locator=item.source_locator if isinstance(item.source_locator, dict) else item.location,
                 )
             )
         evidence_to_source_id[item.evidence_id] = source_id
@@ -579,8 +680,8 @@ def _build_response_from_m2(question: str, grounded_answer) -> RagQueryResponse:
                 ),
                 claim.text,
             )
-            if background_text.startswith("?????"):
-                background_text = background_text.removeprefix("?????")
+            if background_text.startswith("背景资料："):
+                background_text = background_text.removeprefix("背景资料：")
             answer.facts.append(
                 RagAnswerSegment(text=f"背景资料：{background_text}", citation_ids=citation_ids)
             )
@@ -683,6 +784,16 @@ def _build_citation(source_id: int, chunk: dict) -> RagCitation:
         task_type=metadata.get("task_type"),
         equipment=metadata.get("equipment"),
         measurement=metadata.get("measurement"),
+        knowledge_source_id=chunk.get("source_id") or metadata.get("source_id"),
+        generation_id=chunk.get("generation_id") or metadata.get("generation_id"),
+        evidence_id=chunk.get("evidence_id") or f"chunk:{chunk.get('chunk_id')}",
+        document_version=chunk.get("version") or metadata.get("version"),
+        content_hash=chunk.get("content_hash"),
+        source_locator={
+            "source_path": chunk.get("source_path"), "section": chunk.get("section"),
+            "page_number": chunk.get("page_number"), "sheet_name": chunk.get("sheet_name"),
+            "row_start": chunk.get("row_start"), "row_end": chunk.get("row_end"),
+        },
     )
 
 
@@ -740,10 +851,10 @@ def _build_conclusion(question: str, chunks: list[dict]) -> str:
         if summary and summary not in seen:
             summaries.append(summary)
             seen.add(summary)
-    summary_text = "?".join(summaries)
+    summary_text = "；".join(summaries)
     if _mentions_fact_layer(question):
-        return f"??????????????????????????pending ??????? SQLite ????????????????{summary_text}"
-    return f"??????????????????{summary_text}"
+        return f"知识库只提供只读资料，不能代替实时状态、pending 审批或 SQLite 事实层。相关资料：{summary_text}"
+    return f"根据当前检索到的资料：{summary_text}"
 
 
 def _select_answer_chunks(question: str, chunks: list[dict], top_k: int) -> list[dict]:
@@ -867,32 +978,31 @@ def _is_recipe_query(question: str) -> bool:
         return False
     if _is_tap_applicability_query(question) or _is_tap_sterilization_query(question):
         return False
-    text = question or ""
-    has_medium = bool(re.search(r"tap|鍩瑰吇鍩簗medium", text, re.I))
-    asks_recipe = bool(
-        re.search(r"閰嶆柟|缁勫垎|鎴愬垎|缁勬垚|鍖呭惈|鍚湁鍝簺|鍖呮嫭鍝簺|recipe|composition|component", text, re.I)
-    )
-    return asks_recipe and (has_medium or bool(re.search(r"閰嶆柟|recipe", text, re.I)))
+    normalized = normalize_rag_query(question)
+    text = normalized.normalized_query
+    has_medium = "recipe" in normalized.concepts or bool(re.search(r"tap|培养基|medium", text, re.I))
+    asks_recipe = bool(re.search(r"配方|组分|成分|组成|包含|含有哪些|包括哪些|recipe|composition|component", text, re.I))
+    return asks_recipe and (has_medium or bool(re.search(r"配方|recipe", text, re.I)))
 
 
 def _is_tap_applicability_query(question: str) -> bool:
     text = question or ""
-    return bool(re.search(r"tap|鍩瑰吇鍩簗medium", text, re.I)) and bool(
-        re.search(r"閫傜敤浜巪閫傚悎|鎵€鏈墊鍏ㄩ儴|all|any|Chlorella|灏忕悆钘粅鍝佺郴", text, re.I)
+    return bool(re.search(r"tap|培养基|medium", text, re.I)) and bool(
+        re.search(r"适用于|适合|所有|全部|all|any|Chlorella|小球藻|品系", text, re.I)
     )
 
 
 def _is_tap_sterilization_query(question: str) -> bool:
     text = question or ""
-    return bool(re.search(r"tap|鍩瑰吇鍩簗medium", text, re.I)) and bool(
-        re.search(r"鐏弻|楂樺帇|121|20\s*鍒嗛挓|autoclave|sterili", text, re.I)
+    return bool(re.search(r"tap|培养基|medium", text, re.I)) and bool(
+        re.search(r"灭菌|高压|121|20\s*分钟|autoclave|sterili", text, re.I)
     )
 
 
 def _is_paper_query(question: str) -> bool:
     return bool(
         re.search(
-            r"璁烘枃|paper|鏂囩尞|literature|machine learning|deep learning|data-driven|growth prediction|forecasting",
+            r"论文|paper|文献|literature|machine learning|deep learning|data-driven|growth prediction|forecasting",
             question or "",
             re.I,
         )
@@ -912,7 +1022,7 @@ def _is_experiment_data_query(question: str) -> bool:
 def _is_manual_operation_query(question: str) -> bool:
     return bool(
         re.search(
-            r"瀹為獙鎵嬪唽|鎵嬪唽|manual|sop|protocol|鎿嶄綔|姝ラ|娴佺▼|鎬庝箞|濡備綍|鐢靛嚮|杞寲|骞虫澘|澶嶈嫃",
+            r"实验手册|手册|manual|sop|protocol|操作|步骤|流程|怎么|如何|电击|转化|平板|复苏",
             question or "",
             re.I,
         )
@@ -923,11 +1033,11 @@ def _recipe_focus(question: str) -> str:
     text = question or ""
     if re.search(r"磷酸盐|phosphate|K2HPO4|KH2PO4|K2HPO4|KH2PO4", text, re.I):
         return "phosphate"
-    if re.search(r"Hutner|寰噺|trace|EDTA|ZnSO4|FeSO4|閲戝睘", text, re.I):
+    if re.search(r"Hutner|微量|trace|EDTA|ZnSO4|FeSO4|金属", text, re.I):
         return "trace"
-    if re.search(r"鐩愭憾娑瞸姘簮|NH4Cl|MgSO4|CaCl2|salt", text, re.I):
+    if re.search(r"盐溶液|氮源|NH4Cl|MgSO4|CaCl2|salt", text, re.I):
         return "salts"
-    if re.search(r"宸ヤ綔娑瞸鍐颁箼閰竱Tris|姣嶆恫.*鍔犲叆|1\s*L", text, re.I):
+    if re.search(r"工作液|冰乙酸|Tris|母液.*加入|1\s*L", text, re.I):
         return "working"
     return "all"
 
@@ -1186,7 +1296,7 @@ def _parse_pipe_pairs(content: str) -> list[tuple[str, str]]:
         unit_suffix = " g"
     pairs = []
     for row in rows:
-        if not row or row[0] == "缁勫垎":
+        if not row or row[0] in {"组分", "成分"}:
             continue
         if len(row) >= 2 and row[0] and row[1]:
             value = _append_unit(row[1], unit_suffix)
@@ -1239,16 +1349,16 @@ def _summarize_recipe_chunk(chunk: dict) -> str:
     section = str(chunk.get("section") or "")
     if "table 4" in section:
         pairs = _parse_pipe_pairs(chunk.get("content") or "")
-        return "宸ヤ綔娑查厤鍒讹細" + _format_pairs(pairs) if pairs else _summarize_content(chunk["content"])
+        return "工作液配制：" + _format_pairs(pairs) if pairs else _summarize_content(chunk["content"])
     if "table 1" in section:
         pairs = _parse_pipe_pairs(chunk.get("content") or "")
-        return "姣嶆恫1锛堢洂婧舵恫锛夛細" + _format_pairs(pairs) if pairs else _summarize_content(chunk["content"])
+        return "母液1（盐溶液）：" + _format_pairs(pairs) if pairs else _summarize_content(chunk["content"])
     if "table 2" in section:
         pairs = _parse_pipe_pairs(chunk.get("content") or "")
-        return "姣嶆恫2锛堢７閰哥洂婧舵恫锛夛細" + _format_pairs(pairs) if pairs else _summarize_content(chunk["content"])
+        return "母液2（磷酸盐溶液）：" + _format_pairs(pairs) if pairs else _summarize_content(chunk["content"])
     if "table 3" in section:
         pairs = _parse_trace_table(chunk.get("content") or "")
-        return "姣嶆恫3锛圚utner's 寰噺鍏冪礌锛夛細" + _format_pairs(pairs) if pairs else _summarize_content(chunk["content"])
+        return "母液3（Hutner's 微量元素）：" + _format_pairs(pairs) if pairs else _summarize_content(chunk["content"])
     return _summarize_content(chunk["content"])
 
 

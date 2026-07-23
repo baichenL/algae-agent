@@ -2,6 +2,7 @@ import math
 import os
 import re
 import time
+from datetime import datetime, timezone
 from collections import Counter
 from dataclasses import dataclass
 
@@ -13,16 +14,8 @@ from app.core.database import (
     search_rag_chunks,
 )
 from app.services.rag.embedding_service import embed_query, embedding_runtime_status, get_embedding_config
+from app.services.rag.query_normalizer import normalize_rag_query
 from app.services.rag.retrieval.rrf import reciprocal_rank_fusion
-
-
-DOC_TYPE_PRIORITY = {
-    "media_recipe": 0,
-    "manual": 1,
-    "experiment_data": 2,
-    "paper": 3,
-    "document": 4,
-}
 
 
 DOMAIN_EXPANSIONS = {
@@ -84,25 +77,39 @@ def retrieve_hybrid_bundle(
     metadata_filters: dict | None = None,
 ) -> RetrievalBundle:
     requested = max(int(top_k or 5), 1)
+    normalized = normalize_rag_query(question)
     query = RetrievalQuery(
         original_query=question,
+        normalized_query=normalized.normalized_query,
+        query_type=normalized.intent,
         metadata_filters=metadata_filters or {},
         top_k=requested,
-        sparse_top_k=max(requested * 6, 12),
-        dense_top_k=max(requested * 6, 12),
-        rerank_top_k=requested,
+        sparse_top_k=max(50, requested),
+        dense_top_k=max(50, requested),
+        rerank_top_k=min(30, max(requested, 1)),
+        trace_context={"query_normalization": normalized.model_dump()},
     )
     timings = {}
     warnings = []
+    generation_id = (metadata_filters or {}).get("generation_id")
+    source_ids = (metadata_filters or {}).get("source_ids") or None
+    version_policy = (metadata_filters or {}).get("version_policy") or "current"
+    as_of = (metadata_filters or {}).get("as_of")
 
     started = time.perf_counter()
-    lexical_rows = search_rag_chunks(question, top_k=query.sparse_top_k, doc_types=doc_types)
+    lexical_rows = search_rag_chunks(
+        normalized.sparse_query, top_k=query.sparse_top_k, doc_types=doc_types, generation_id=generation_id,
+        source_ids=source_ids, version_policy=version_policy, as_of=as_of,
+    )
     lexical_rows = _filter_rows(lexical_rows, metadata_filters)
     sparse_hits = [_row_to_hit(row, "sparse", rank) for rank, row in enumerate(lexical_rows, start=1)]
     timings["sparse"] = _elapsed_ms(started)
 
     started = time.perf_counter()
-    vector_rows = _embedding_search(question, top_k=query.dense_top_k, doc_types=doc_types)
+    vector_rows = _embedding_search(
+        normalized.dense_query, top_k=query.dense_top_k, doc_types=doc_types, generation_id=generation_id,
+        source_ids=source_ids, version_policy=version_policy, as_of=as_of,
+    )
     vector_rows = _filter_rows(vector_rows, metadata_filters)
     if not vector_rows:
         warnings.append(f"dense_retrieval_unavailable:{embedding_runtime_status()['status']}")
@@ -112,22 +119,20 @@ def retrieve_hybrid_bundle(
     timings["dense"] = _elapsed_ms(started)
 
     started = time.perf_counter()
-    semantic_rows = _semantic_search(question, top_k=query.sparse_top_k, doc_types=doc_types)
-    semantic_rows = _filter_rows(semantic_rows, metadata_filters)
+    semantic_rows = []
+    if _semantic_fallback_enabled():
+        semantic_rows = _semantic_search(
+            normalized.normalized_query, top_k=query.sparse_top_k, doc_types=doc_types, generation_id=generation_id,
+            source_ids=source_ids, version_policy=version_policy, as_of=as_of,
+        )
+        semantic_rows = _filter_rows(semantic_rows, metadata_filters)
+        warnings.append("semantic_fallback_explicitly_enabled")
     semantic_hits = [_row_to_hit(row, "semantic_fallback", rank) for rank, row in enumerate(semantic_rows, start=1)]
     timings["semantic_fallback"] = _elapsed_ms(started)
 
     started = time.perf_counter()
     fused = reciprocal_rank_fusion(sparse_hits, dense_hits, semantic_hits)
-    fused.sort(
-        key=lambda hit: (
-            DOC_TYPE_PRIORITY.get(hit.metadata.get("doc_type"), 99),
-            -float(hit.fusion_score or 0.0),
-            hit.metadata.get("file_name") or "",
-            int(hit.metadata.get("chunk_index") or 0),
-            hit.evidence_id,
-        )
-    )
+    fused.sort(key=lambda hit: (-float(hit.fusion_score or 0.0), hit.evidence_id))
     timings["fusion"] = _elapsed_ms(started)
 
     selected = _dedupe_hits(fused, requested)
@@ -155,6 +160,14 @@ def _elapsed_ms(started: float) -> float:
 
 def _dense_retrieval_enabled() -> bool:
     return os.getenv("RAG_DENSE_RETRIEVAL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _semantic_fallback_enabled() -> bool:
+    explicit = os.getenv("RAG_SEMANTIC_FALLBACK_ENABLED")
+    if explicit is not None:
+        return explicit.strip().lower() in {"1", "true", "yes", "on"}
+    # Fake embeddings are test/development-only; keep the old fallback observable there.
+    return get_embedding_config().provider == "fake"
 
 
 def _row_to_hit(row: dict, source: str, rank: int) -> RetrievalHit:
@@ -235,14 +248,10 @@ def _dedupe_hits(hits: list[RetrievalHit], top_k: int) -> list[RetrievalHit]:
 
 def _filter_rows(rows: list[dict], metadata_filters: dict | None) -> list[dict]:
     filters = metadata_filters or {}
-    if not filters:
-        return rows
-    sources_by_path = {}
-    if filters.get("trust_level") or filters.get("source_type"):
-        sources_by_path = {
-            row.get("source_path"): row
-            for row in list_rag_knowledge_sources()
-        }
+    sources_by_path = {
+        str(row.get("source_path") or "").replace("\\", "/").casefold(): row
+        for row in list_rag_knowledge_sources()
+    }
     return [
         row
         for row in rows
@@ -256,7 +265,26 @@ def _matches_metadata_filter(row: dict, filters: dict, sources_by_path: dict) ->
         wanted = filters.get(key)
         if wanted and str(row.get(key) or metadata.get(key) or "") != str(wanted):
             return False
-    source = sources_by_path.get(row.get("source_path")) or {}
+    source = sources_by_path.get(str(row.get("source_path") or "").replace("\\", "/").casefold()) or {}
+    if source and (
+        source.get("lifecycle_status", "active") != "active"
+        or source.get("review_status", "approved") != "approved"
+    ):
+        return False
+    source_ids = filters.get("source_ids") or []
+    row_source_id = row.get("source_id") or metadata.get("source_id") or source.get("source_id")
+    if source_ids and row_source_id not in source_ids:
+        return False
+    version_policy = filters.get("version_policy") or "current"
+    as_of = filters.get("as_of")
+    if version_policy in {"current", "as_of"} and source:
+        instant = _parse_instant(as_of) if version_policy == "as_of" else datetime.now(timezone.utc)
+        effective_from = _parse_instant(source.get("effective_from"))
+        effective_to = _parse_instant(source.get("effective_to"))
+        if effective_from and instant < effective_from:
+            return False
+        if effective_to and instant >= effective_to:
+            return False
     for key in ("trust_level", "source_type"):
         wanted = filters.get(key)
         if wanted and str(source.get(key) or "") != str(wanted):
@@ -266,6 +294,19 @@ def _matches_metadata_filter(row: dict, filters: dict, sources_by_path: dict) ->
     if wanted_evidence and wanted_evidence != "text_chunk":
         return False
     return True
+
+
+def _parse_instant(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _merge_candidates(
@@ -346,7 +387,10 @@ def _merge_candidates(
     return merged
 
 
-def _embedding_search(question: str, top_k: int, doc_types: list[str] | None = None) -> list[dict]:
+def _embedding_search(
+    question: str, top_k: int, doc_types: list[str] | None = None, generation_id: str | None = None,
+    source_ids: list[str] | None = None, version_policy: str = "current", as_of: str | None = None,
+) -> list[dict]:
     if not _dense_retrieval_enabled():
         return []
     status = embedding_runtime_status()
@@ -364,6 +408,10 @@ def _embedding_search(question: str, top_k: int, doc_types: list[str] | None = N
         embedding_model=get_embedding_config().model,
         top_k=top_k,
         doc_types=doc_types,
+        generation_id=generation_id,
+        source_ids=source_ids,
+        version_policy=version_policy,
+        as_of=as_of,
     )
     return [
         {
@@ -398,25 +446,24 @@ def _metadata_boost(chunk: dict, metadata_filters: dict | None) -> float:
     return min(boost, 1.0)
 
 
-def _semantic_search(question: str, top_k: int, doc_types: list[str] | None = None) -> list[dict]:
+def _semantic_search(
+    question: str, top_k: int, doc_types: list[str] | None = None, generation_id: str | None = None,
+    source_ids: list[str] | None = None, version_policy: str = "current", as_of: str | None = None,
+) -> list[dict]:
     query_vector = _semantic_vector(question)
     if not query_vector:
         return []
-    rows = list_rag_chunks_for_semantic(doc_types=doc_types, limit=1000)
+    rows = list_rag_chunks_for_semantic(
+        doc_types=doc_types, limit=1000, generation_id=generation_id,
+        source_ids=source_ids, version_policy=version_policy, as_of=as_of,
+    )
     scored = []
     for row in rows:
         score = _cosine(query_vector, _chunk_vector(row))
         if score <= 0:
             continue
         scored.append({**row, "semantic_score": score})
-    scored.sort(
-        key=lambda row: (
-            DOC_TYPE_PRIORITY.get(row.get("doc_type"), 99),
-            -float(row.get("semantic_score") or 0.0),
-            row.get("file_name") or "",
-            int(row.get("chunk_index") or 0),
-        )
-    )
+    scored.sort(key=lambda row: (-float(row.get("semantic_score") or 0.0), row.get("chunk_id") or ""))
     return scored[: max(int(top_k or 5), 1)]
 
 
@@ -494,7 +541,7 @@ def _semantic_vector(text: str) -> Counter:
 
 def _tokens(text: str) -> list[str]:
     raw = str(text or "").lower()
-    raw = raw.replace("鈧?", "").replace("渭", "u").replace("碌", "u")
+    raw = raw.replace("μ", "u").replace("µ", "u")
     tokens = re.findall(r"[a-z0-9_+\-]+|[\u4e00-\u9fff]{2,}", raw)
     normalized = []
     for token in tokens:

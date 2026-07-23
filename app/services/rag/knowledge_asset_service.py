@@ -9,6 +9,7 @@ from typing import Any
 from app.core.db import rag as rag_db
 from app.services.rag.ingestion.index_store import ingest_file
 from app.services.rag.ingestion.metadata import SUPPORTED_EXTENSIONS
+from app.services.rag.security import scan_knowledge_text
 
 
 KNOWLEDGE_UPLOAD_ROOT = Path(os.getenv("KNOWLEDGE_UPLOAD_ROOT", "data/raw/uploads"))
@@ -33,6 +34,10 @@ def save_uploaded_source(
     title: str | None = None,
     version: str | None = None,
     language: str | None = None,
+    asset_key: str | None = None,
+    effective_from: str | None = None,
+    effective_to: str | None = None,
+    supersedes_source_id: str | None = None,
 ) -> dict[str, Any]:
     if doc_type not in KNOWLEDGE_DOC_TYPES:
         raise ValueError("invalid_doc_type")
@@ -47,6 +52,7 @@ def save_uploaded_source(
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{uuid.uuid4().hex}__{_safe_name(filename)}"
     target.write_bytes(content)
+    scan = scan_knowledge_text(content.decode("utf-8", errors="ignore"))
     source_id = rag_db.upsert_rag_knowledge_source(
         source_path=str(target),
         file_name=Path(filename).name,
@@ -54,9 +60,15 @@ def save_uploaded_source(
         version=version,
         language=language,
         owner=owner,
-        ingestion_status="pending",
+        ingestion_status="pending" if scan.safe else "review_required",
         metadata={"topic": title or Path(filename).stem, "extension": suffix, "original_filename": Path(filename).name},
         chunk_count=0,
+        asset_key=asset_key,
+        effective_from=effective_from,
+        effective_to=effective_to,
+        supersedes_source_id=supersedes_source_id,
+        security_flags=scan.flags,
+        review_status="approved" if scan.safe else "review_required",
     )
     return rag_db.get_rag_knowledge_source(source_id)
 
@@ -75,6 +87,10 @@ def index_source(source_id: str, *, rebuild: bool = False) -> dict[str, Any]:
             "topic": metadata.get("topic") or Path(source["file_name"]).stem,
             "version": source.get("version"),
             "language": source.get("language"),
+            "asset_key": source.get("asset_key"),
+            "effective_from": source.get("effective_from"),
+            "effective_to": source.get("effective_to"),
+            "supersedes_source_id": source.get("supersedes_source_id"),
         },
     )
 

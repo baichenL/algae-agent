@@ -14,6 +14,7 @@ from app.services.rag.embedding_service import embedding_runtime_status
 from app.services.rag.eval.hybrid_demo import build_hybrid_demo_report
 from app.services.rag.eval.mini_eval import run_mini_eval, seed_default_mini_eval_cases
 from app.services.rag.eval.retrieval_eval import run_retrieval_eval
+from app.services.rag.retrieval.reranker import reranker_runtime_status
 from app.services.rag.service import answer_rag_question
 
 router = APIRouter()
@@ -39,6 +40,7 @@ async def rag_index_status(_: ApiPrincipal = Depends(require_viewer)):
         "status": "success",
         "index": get_rag_index_status(),
         "embedding": embedding_runtime_status(),
+        "reranker": reranker_runtime_status(),
     }
 
 
