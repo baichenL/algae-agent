@@ -130,6 +130,19 @@ async def handle_workflow_intent(
                 "natural_reply": "已取消尚未创建审批单的传代 Workflow 请求。",
             },
         )
+    if decision.speech_act == SpeechAct.SUSPEND:
+        clear_workflow_request_state(session_id)
+        return _complete_chat_response(
+            session_id,
+            conversation_history,
+            {
+                "agent_output": {
+                    "action": "workflow_request_suspended",
+                    "status": "suspended",
+                },
+                "natural_reply": "已暂停尚未创建审批单的传代 Workflow 请求，并开始处理新任务。",
+            },
+        )
 
     strain_id = decision.target.canonical_id if decision.target else None
     if not strain_id:

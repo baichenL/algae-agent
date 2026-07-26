@@ -4,9 +4,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from app.core import database
-from app.core.db import scientific as scientific_db
-from app.services.observability.agent_trace import build_agent_run_trace
+from app.core.workspaces import current_workspace
 # Initialize the runtime package before importing the shared Tool Gateway. The
 # existing chat stack also owns dispatcher imports, so this order avoids a
 # package-initialization cycle when the MCP server is launched standalone.
@@ -25,37 +23,71 @@ mcp = FastMCP(
 
 
 def _ctx(source: str) -> ToolExecutionContext:
-    return ToolExecutionContext(caller="mcp_local", source=source, session_id="mcp-local")
+    return ToolExecutionContext(
+        caller="mcp_local",
+        source=source,
+        session_id="mcp-local",
+        principal_id="mcp-local",
+        workspace_id=current_workspace().id,
+        role="scientist",
+    )
 
 
 @mcp.resource("algae://lab/state")
-def lab_state() -> dict[str, Any]:
+async def lab_state() -> dict[str, Any]:
+    strains = await execute_registered_tool(
+        "list_algae_strains", {}, context=_ctx("mcp.lab_state.strains")
+    )
+    datasets = await execute_registered_tool(
+        "scientific_datasets_list", {}, context=_ctx("mcp.lab_state.datasets")
+    )
+    devices = await execute_registered_tool(
+        "lab_devices_list", {}, context=_ctx("mcp.lab_state.devices")
+    )
     return {
-        "strains": database.list_algae_status(),
-        "datasets": scientific_db.list_datasets(),
-        "devices": scientific_db.list_lab_devices(),
+        "strains": (strains.get("response_payload") or {}).get("strains") or [],
+        "datasets": (datasets.get("response_payload") or {}).get("datasets") or [],
+        "devices": (devices.get("response_payload") or {}).get("devices") or [],
         "boundary": "MCP resources are read-only and cannot authorize execution.",
     }
 
 
 @mcp.resource("algae://datasets/{dataset_id}")
-def dataset_resource(dataset_id: str) -> dict[str, Any]:
-    return scientific_db.get_dataset(dataset_id, include_measurements=False) or {"error": "dataset_not_found"}
+async def dataset_resource(dataset_id: str) -> dict[str, Any]:
+    result = await execute_registered_tool(
+        "scientific_dataset_get",
+        {"dataset_id": dataset_id},
+        context=_ctx("mcp.dataset_resource"),
+    )
+    return result.get("response_payload") or result
 
 
 @mcp.resource("algae://scientific-runs/{run_id}")
-def scientific_run_resource(run_id: str) -> dict[str, Any]:
-    return scientific_db.get_scientific_run(run_id) or {"error": "scientific_run_not_found"}
+async def scientific_run_resource(run_id: str) -> dict[str, Any]:
+    result = await execute_registered_tool(
+        "scientific_run_get",
+        {"scientific_run_id": run_id},
+        context=_ctx("mcp.scientific_run_resource"),
+    )
+    return result.get("response_payload") or result
 
 
 @mcp.resource("algae://devices")
-def devices_resource() -> dict[str, Any]:
-    return {"devices": scientific_db.list_lab_devices(), "physical_execution_available": False}
+async def devices_resource() -> dict[str, Any]:
+    result = await execute_registered_tool(
+        "lab_devices_list", {}, context=_ctx("mcp.devices_resource")
+    )
+    return result.get("response_payload") or result
 
 
 @mcp.resource("algae://traces/{agent_run_id}")
-def trace_resource(agent_run_id: str) -> dict[str, Any]:
-    return build_agent_run_trace(agent_run_id) or {"error": "agent_trace_not_found"}
+async def trace_resource(agent_run_id: str) -> dict[str, Any]:
+    result = await execute_registered_tool(
+        "agent_trace_read",
+        {"agent_run_id_query": agent_run_id},
+        context=_ctx("mcp.trace_resource"),
+    )
+    return result.get("response_payload") or result
 
 
 @mcp.tool()

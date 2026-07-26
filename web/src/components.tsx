@@ -1,5 +1,8 @@
 import { useMemo } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import rehypeSanitize from 'rehype-sanitize'
 import ReactEChartsCore from 'echarts-for-react/lib/core'
 import * as echarts from 'echarts/core'
 import { LineChart } from 'echarts/charts'
@@ -17,11 +20,15 @@ import ErrorRounded from '@mui/icons-material/ErrorRounded'
 import PendingRounded from '@mui/icons-material/PendingRounded'
 import ScienceRounded from '@mui/icons-material/ScienceRounded'
 import AutoFixHighRounded from '@mui/icons-material/AutoFixHighRounded'
-import type { ActionDescriptor, Approval, Artifact, OperationSummary, ReplanSummary, RunDetail, RunSummary } from './types'
+import type { ActionDescriptor, AnswerEnvelope, Approval, Artifact, OperationSummary, ReplanSummary, RunDetail, RunSummary } from './types'
 
 echarts.use([LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer])
 
 const statusMeta: Record<string, { label: string; color: 'default' | 'success' | 'warning' | 'error' | 'info' }> = {
+  paused: { label: '已暂停', color: 'warning' },
+  partial: { label: '部分完成', color: 'warning' },
+  needs_input: { label: '需要输入', color: 'info' },
+  success: { label: '已完成', color: 'success' },
   queued: { label: '排队中', color: 'info' }, running: { label: '运行中', color: 'info' },
   waiting_input: { label: '等待人工', color: 'warning' }, waiting_approval: { label: '等待审批', color: 'warning' },
   ready_to_execute: { label: '可执行', color: 'success' }, succeeded: { label: '已完成', color: 'success' },
@@ -33,6 +40,115 @@ const statusMeta: Record<string, { label: string; color: 'default' | 'success' |
 export function StatusChip({ status, size = 'small' }: { status: string; size?: 'small' | 'medium' }) {
   const meta = statusMeta[status] || { label: status || '未知', color: 'default' as const }
   return <Chip size={size} color={meta.color} label={meta.label} variant={meta.color === 'default' ? 'outlined' : 'filled'} />
+}
+
+export function MarkdownMessage({ children }: { children: string }) {
+  return <Box
+    className="markdown-message"
+    sx={{
+      overflowWrap: 'anywhere',
+      '& > :first-of-type': { mt: 0 },
+      '& > :last-child': { mb: 0 },
+      '& table': { width: '100%', borderCollapse: 'collapse', my: 1 },
+      '& th, & td': { border: '1px solid', borderColor: 'divider', px: 1, py: 0.75, textAlign: 'left' },
+      '& pre': { overflowX: 'auto', p: 1.25, borderRadius: 1, bgcolor: '#f5f7f7' },
+      '& code': { fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace' },
+      '& a': { color: 'primary.main' },
+    }}
+  >
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeSanitize]}
+      components={{
+        a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+      }}
+    >
+      {children}
+    </ReactMarkdown>
+  </Box>
+}
+
+export function DeveloperDetails({ value }: { value: unknown }) {
+  return <Box component="details" sx={{ mt: 1 }}>
+    <Box component="summary" sx={{ cursor: 'pointer', color: 'text.secondary', fontSize: 13, fontWeight: 700 }}>
+      开发者详情
+    </Box>
+    <Box mt={1}><DebugJson value={value} /></Box>
+  </Box>
+}
+
+function compactSummary(value: unknown): string {
+  if (value == null) return '—'
+  if (typeof value !== 'object') return String(value)
+  const item = value as Record<string, any>
+  return String(item.title || item.name || item.candidate_id || item.id || item.status || item.conclusion || '结构化结果')
+}
+
+export function AnswerEnvelopeCard({
+  envelope,
+  draft,
+  onResume,
+}: {
+  envelope?: AnswerEnvelope
+  draft?: Record<string, any>
+  onResume?: () => void
+}) {
+  if (!envelope) return null
+  const limitations = envelope.source_statuses.filter(item => ['failed', 'degraded', 'empty'].includes(item.status))
+  const blocks = envelope.presentation_blocks || (draft ? [{ type: 'email_draft', draft, send: false as const }] : [])
+  return <Stack spacing={1.25} mt={1.5}>
+    <Stack direction="row" spacing={1} alignItems="center">
+      <StatusChip status={envelope.outcome_status} />
+      <Typography variant="caption" color="text.secondary">结构化结果</Typography>
+    </Stack>
+    {blocks.map((block: any, index) => {
+      if (block.type === 'email_draft') {
+        const item = block.draft || {}
+        return <Card key={`email-${index}`} variant="outlined"><CardContent sx={{ py: 1.5 }}>
+          <Typography variant="subtitle2">邮件草稿</Typography>
+          {block.target && <Typography variant="caption" display="block">目标：{block.target}</Typography>}
+          <Typography variant="caption" display="block">收件人：{(item.recipients || []).join(', ') || '未设置'}</Typography>
+          <Typography fontWeight={700} mt={0.5}>{item.subject}</Typography>
+          <Typography variant="body2" whiteSpace="pre-wrap" mt={0.5}>{item.body}</Typography>
+          <Chip size="small" color="info" variant="outlined" label="尚未发送" sx={{ mt: 1 }} />
+        </CardContent></Card>
+      }
+      if (block.type === 'approval') return <Alert key={`approval-${index}`} severity="warning" action={<Button component={RouterLink} to="/approvals" size="small">查看审批</Button>}>
+        待审批请求 #{block.pending_id} 已创建；必须由人工审批，当前不可执行。
+      </Alert>
+      if (block.type === 'scientific_result') return <Card key={`science-${index}`} variant="outlined"><CardContent sx={{ py: 1.5 }}>
+        <Stack direction="row" spacing={1} alignItems="center"><ScienceRounded color="primary" /><Typography variant="subtitle2">科学结果</Typography><Chip size="small" label={`${block.candidate_count || 0} 个候选`} /></Stack>
+        {!!block.candidates?.length && <List dense>{block.candidates.map((item: unknown, itemIndex: number) => <ListItem key={itemIndex} disableGutters><ListItemText primary={compactSummary(item)} secondary={`候选 ${itemIndex + 1}`} /></ListItem>)}</List>}
+        <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap mt={1}>
+          <Chip size="small" variant="outlined" label={`验证 ${block.validations?.length || 0}`} />
+          <Chip size="small" variant="outlined" label={`仿真 ${block.simulations?.length || 0}`} />
+          <Chip size="small" variant="outlined" label={`PlanPatch ${block.plan_patches?.length || 0}`} />
+        </Stack>
+      </CardContent></Card>
+      if (block.type === 'paused_task') return <Alert key={`paused-${index}`} severity="warning">
+        <Typography fontWeight={800}>任务已暂停</Typography>
+        <Typography variant="body2">{block.reason || '已保存 checkpoint，可稍后继续。'}</Typography>
+        {!!block.remaining_work?.length && <Typography variant="caption">剩余工作：{block.remaining_work.map(compactSummary).join('；')}</Typography>}
+      </Alert>
+      return null
+    })}
+    {!!limitations.length && <Alert severity={envelope.outcome_status === 'failed' ? 'error' : 'warning'}>
+      {limitations.map(item => `${item.source}: ${item.status}${item.impact ? `（${item.impact}）` : ''}`).join('；')}
+    </Alert>}
+    {!!envelope.unknowns.length && <Box>
+      <Typography variant="caption" fontWeight={800}>限制与未知</Typography>
+      {envelope.unknowns.map((item, index) => <Typography key={index} variant="body2">• {item}</Typography>)}
+    </Box>}
+    <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+      {envelope.references.map((ref, index) => {
+        if (ref.type === 'pending') return <Button key={index} component={RouterLink} to="/approvals" size="small">查看审批 #{ref.id}</Button>
+        if (ref.type === 'scientific_run') return <Button key={index} component={RouterLink} to={`/runs/${encodeURIComponent(`scientific:${ref.id}`)}`} size="small">Scientific Run</Button>
+        if (ref.type === 'agent_trace') return <Button key={index} component={RouterLink} to={`/runs/${encodeURIComponent(`agent:${ref.id}`)}`} size="small">Agent Trace</Button>
+        return null
+      })}
+      {envelope.outcome_status === 'paused' && onResume && <Button size="small" variant="contained" onClick={onResume}>继续任务</Button>}
+    </Stack>
+  </Stack>
 }
 
 export function formatDate(value?: string) {

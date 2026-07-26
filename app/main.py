@@ -20,14 +20,15 @@ from app.services.agent_runtime.checkpoint import (
     shutdown_agent_runtime_graph,
 )
 from app.services.agent_runtime.graph_runtime import build_agent_runtime_graph
-from app.services.notifications.scheduler_service import email_scheduler_loop
-from app.services.approval_execution_service import recover_approved_executions
 from app.core.db import operations
 from app.services.chat.legacy_task_migration import import_legacy_task_states
 from app.services.user_memory.migration import import_legacy_user_memories
 from app.services.user_memory.curator import curate_all_user_memories
 from app.services.rag.retrieval.reranker import prewarm_reranker, reranker_runtime_status
-from app.core.db.connection import connect
+from app.core.model_registry import model_runtime_status, probe_model_capabilities
+from app.services.rag.embedding_service import embedding_runtime_status, probe_embedding_capability
+from app.core.db.connection import connect, connect_domain_readonly
+from app.core.workspaces import current_workspace
 
 
 @asynccontextmanager
@@ -39,9 +40,38 @@ async def lifespan(app: FastAPI):
     operations.fail_interrupted_operations()
     await initialize_agent_runtime_graph(build_agent_runtime_graph)
     await process_pending_resume_jobs()
-    await recover_approved_executions()
+    if (
+        os.getenv("ALGAE_AUTH_MODE", "required").casefold() == "test"
+        or os.getenv("TRUSTED_WORKER_INLINE", "false").casefold() in {"1", "true", "yes", "on"}
+    ):
+        from app.services.approval_execution_service import recover_approved_executions
+
+        await recover_approved_executions()
     await cleanup_agent_runtime_checkpoints(retention_days=7, max_completed_threads=500)
     database.cleanup_completed_resume_jobs(older_than=time_days_ago(7))
+
+    try:
+        app.state.model_capabilities = await asyncio.wait_for(
+            asyncio.to_thread(probe_model_capabilities),
+            timeout=float(os.getenv("MODEL_CAPABILITY_PROBE_TIMEOUT_SECONDS", "30")),
+        )
+    except asyncio.TimeoutError:
+        app.state.model_capabilities = {
+            "status": "unavailable",
+            "probe": "timeout",
+            "roles": {},
+        }
+    try:
+        app.state.embedding_capability = await asyncio.wait_for(
+            asyncio.to_thread(probe_embedding_capability),
+            timeout=float(os.getenv("RAG_EMBEDDING_PROBE_TIMEOUT_SECONDS", "20")),
+        )
+    except asyncio.TimeoutError:
+        app.state.embedding_capability = {
+            "status": "degraded",
+            "degraded": True,
+            "degraded_reason": "embedding_probe_timeout",
+        }
 
     try:
         app.state.rag_reranker = await asyncio.wait_for(asyncio.to_thread(prewarm_reranker), timeout=60)
@@ -49,13 +79,21 @@ async def lifespan(app: FastAPI):
         app.state.rag_reranker = reranker_runtime_status(reason="prewarm_timeout_60s")
 
     monitor_task = asyncio.create_task(daily_schedule_monitor())
-    scheduler_task = asyncio.create_task(email_scheduler_loop())
+    scheduler_task = None
+    if os.getenv("TRUSTED_WORKER_INLINE", "false").casefold() in {"1", "true", "yes", "on"}:
+        from app.services.notifications.scheduler_service import email_scheduler_loop
+
+        scheduler_task = asyncio.create_task(email_scheduler_loop())
 
     yield
 
     for task in (monitor_task, scheduler_task):
+        if task is None:
+            continue
         task.cancel()
     for task in (monitor_task, scheduler_task):
+        if task is None:
+            continue
         try:
             await task
         except asyncio.CancelledError:
@@ -79,7 +117,7 @@ async def health_live():
 
 @app.get("/health/ready", include_in_schema=False)
 async def health_ready():
-    """Readiness probe for the database and configured RAG reranker."""
+    """Readiness probe for storage and configured model capabilities."""
     checks: dict[str, dict] = {}
     ready = True
 
@@ -91,6 +129,18 @@ async def health_ready():
         ready = False
         checks["database"] = {"status": "unavailable", "reason": type(exc).__name__}
 
+    if current_workspace().storage_mode == "split":
+        try:
+            with connect_domain_readonly() as conn:
+                conn.execute("SELECT 1 FROM algae_status LIMIT 1").fetchone()
+            checks["domain_database"] = {"status": "ready", "mode": "read_only"}
+        except Exception as exc:
+            ready = False
+            checks["domain_database"] = {
+                "status": "unavailable",
+                "reason": type(exc).__name__,
+            }
+
     reranker_enabled = os.getenv("RAG_RERANKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
     if reranker_enabled:
         reranker = reranker_runtime_status()
@@ -99,6 +149,19 @@ async def health_ready():
             ready = False
     else:
         checks["reranker"] = {"status": "disabled"}
+
+    models = getattr(app.state, "model_capabilities", None) or model_runtime_status()
+    checks["models"] = models
+    if models.get("status") != "ready":
+        ready = False
+
+    embedding = {
+        **embedding_runtime_status(),
+        **(getattr(app.state, "embedding_capability", None) or {}),
+    }
+    checks["embedding"] = embedding
+    # Retrieval is an optional evidence source. Its failure is visible but
+    # degrades readiness instead of making all database-backed work unavailable.
 
     payload = {"status": "ready" if ready else "not_ready", "checks": checks}
     return JSONResponse(status_code=200 if ready else 503, content=payload)

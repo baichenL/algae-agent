@@ -38,6 +38,8 @@ def _workflow_result(
     requires_approval=True,
     requires_explicit_confirmation=True,
     allowed_callers=["chat_runtime", "workflow_approval_service"],
+    exposed_to_llm=True,
+    executor_kind="proposal",
     idempotency_fields=["strain_id", "agent_run_id"],
     audit_event_type="workflow_subculture_requested",
 )

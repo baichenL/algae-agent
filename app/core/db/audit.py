@@ -1,13 +1,14 @@
 import sqlite3
 
-from app.core.db.connection import DB_PATH
+from app.core.workspaces import DOMAIN_DATABASE_PATH as DB_PATH
+from app.core.db.domain_connection import connect_domain_readonly
 from app.core.time_utils import display_time_string
 
 
 def get_last_db_operation() -> dict:
     """Return the most recent audit record for algae_status operations, or None if none."""
     import json
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_domain_readonly(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM algae_audit ORDER BY performed_at DESC LIMIT 1")

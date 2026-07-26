@@ -113,6 +113,19 @@ def _pending_cancel_response() -> dict:
     }
 
 
+def _pending_suspend_response() -> dict:
+    message = "已暂停当前未完成的补参流程，并开始处理新任务。"
+    return {
+        "agent_output": {
+            "action": "pending_form_suspended",
+            "status": "suspended",
+            "message": message,
+            "msg": message,
+        },
+        "natural_reply": message,
+    }
+
+
 def _delete_candidates_response(state: dict) -> dict:
     candidates = state.get("candidates") or []
     lines = [
@@ -186,6 +199,9 @@ async def handle_pending_form_state(
     if decision.form_action == "cancel":
         clear_pending_form_state(session_id)
         return _complete_chat_response(session_id, conversation_history, _pending_cancel_response())
+    if decision.form_action == "suspend":
+        clear_pending_form_state(session_id)
+        return _complete_chat_response(session_id, conversation_history, _pending_suspend_response())
     if decision.form_action == "conflict":
         return _complete_chat_response(
             session_id,

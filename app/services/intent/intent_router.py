@@ -28,6 +28,7 @@ from app.services.intent.routing_models import (
     ScientificTaskDecision,
     WriteDecision,
 )
+from app.services.intent.task_relation import parse_task_relation_signals
 from app.services.intent.write_action_parser import (
     extract_any_strain_id,
     find_strain_candidates,
@@ -36,6 +37,7 @@ from app.services.intent.write_action_parser import (
     single_candidate_id,
 )
 from app.services.intent.llm_candidate_provider import collect_llm_route_candidates, current_router_diagnostics
+from app.services.chat.email_request import parse_email_request
 
 
 EXPLANATION_KEYWORDS = [
@@ -100,7 +102,10 @@ DUE_SUBCULTURE_QUERY_HINTS = [
     "传代", "临近传代", "需要传代", "该传代", "多久没传",
     "距上次传代", "距离上次传代", "提醒",
 ]
-EMAIL_ACTION_KEYWORDS = ["发邮件", "发送邮件", "邮件提醒", "邮箱提醒", "email", "mail"]
+EMAIL_ACTION_KEYWORDS = [
+    "发邮件", "发送邮件", "邮件提醒", "邮箱提醒", "邮件草稿",
+    "一封邮件", "写封邮件", "写一封邮件", "email", "mail",
+]
 DIRECT_EFFECT_MODIFIERS = ["立即发送", "直接发送", "现在发送", "马上发送"]
 CANCEL_WORDS = ["取消", "放弃", "不用了", "不做了", "停止"]
 WORKFLOW_DIAGNOSTIC_PHRASES = [
@@ -441,7 +446,10 @@ def _has_email(text: str) -> bool:
 
 
 def _is_cancel(text: str) -> bool:
-    return _contains_any(text, CANCEL_WORDS)
+    return (
+        _contains_any(text, CANCEL_WORDS)
+        or parse_task_relation_signals(text).cancel_previous
+    )
 
 
 def _classify_lab_query(text: str) -> str:
@@ -551,6 +559,68 @@ def _detect_fragment(text: str, context_snapshot: Any) -> list[RouteCandidate]:
     strain_matches = find_strain_candidates(text, context_snapshot)
     explicit_strain_id = extract_any_strain_id(text)
 
+    from app.services.scientific.request_spec import parse_scientific_request
+    scientific_request = parse_scientific_request(text, has_target=bool(target and target.canonical_id))
+    if scientific_request.matched:
+        import re
+        from app.core.db.scientific import list_datasets
+
+        explicit_dataset = re.search(r"\bds_[0-9a-f]{8,64}\b", text.casefold())
+        try:
+            datasets = [
+                item for item in list_datasets()
+                if str(item.get("status") or "ready") == "ready"
+            ]
+        except Exception:
+            datasets = []
+        target_id = target.canonical_id if target else None
+        matching = [
+            item for item in datasets
+            if target_id and str(item.get("strain_id") or "") == str(target_id)
+        ]
+        selected = None
+        if explicit_dataset:
+            selected = next(
+                (item for item in datasets if item.get("id") == explicit_dataset.group(0)),
+                None,
+            )
+        elif matching:
+            selected = matching[0]
+        target_mismatch = bool(
+            selected
+            and target_id
+            and str(selected.get("strain_id") or "") != str(target_id)
+        )
+        dataset_id = None if target_mismatch else (selected or {}).get("id")
+        arguments = {
+            "dataset_id": dataset_id,
+            "target_strain_id": target_id,
+            "mode": (
+                "diagnose_and_optimize"
+                if "simulate" in scientific_request.capabilities
+                else "diagnose"
+            ),
+            "candidate_count": scientific_request.candidate_count,
+            "requested_capabilities": list(scientific_request.capabilities),
+            "source_policy": scientific_request.source_policy,
+            "simulation_policy": scientific_request.simulation_policy,
+            "budget_profile": scientific_request.budget_profile,
+            "seek_counterevidence": scientific_request.seek_counterevidence,
+            "dataset_candidates": [item.get("id") for item in matching],
+            "target_dataset_mismatch": target_mismatch,
+        }
+        return [RouteCandidate(
+            RouteKind.SCIENTIFIC_TASK,
+            ReasonCode.SCIENTIFIC_TASK_MATCHED,
+            RiskLevel.MEDIUM if "simulate" in scientific_request.capabilities else RiskLevel.LOW,
+            text,
+            source="rule",
+            target=target,
+            entity_options=entities,
+            arguments=arguments,
+            missing_fields=("target_dataset_mismatch",) if target_mismatch else (),
+        )]
+
     scientific_terms = (
         "生长异常", "增长异常", "生长变慢", "增长变慢", "异常诊断", "实验优化",
         "优化下一轮", "下一轮实验", "growth anomaly", "diagnose growth", "experiment optimization",
@@ -565,7 +635,12 @@ def _detect_fragment(text: str, context_snapshot: Any) -> list[RouteCandidate]:
             datasets = list_datasets()
         except Exception:
             datasets = []
-        dataset_id = match.group(0) if match else (datasets[0]["id"] if len(datasets) == 1 else None)
+        target_id = target.canonical_id if target else None
+        matching = [
+            item for item in datasets
+            if target_id and item.get("status") == "ready" and item.get("strain_id") == target_id
+        ]
+        dataset_id = match.group(0) if match else (matching[0]["id"] if matching else None)
         optimize = any(term in text.casefold() for term in ("优化", "下一轮", "optimization", "optimize"))
         return [RouteCandidate(
             RouteKind.SCIENTIFIC_TASK,
@@ -573,8 +648,11 @@ def _detect_fragment(text: str, context_snapshot: Any) -> list[RouteCandidate]:
             RiskLevel.MEDIUM if optimize else RiskLevel.LOW,
             text,
             source="rule",
+            target=target,
+            entity_options=entities,
             arguments={
                 "dataset_id": dataset_id,
+                "target_strain_id": target_id,
                 "mode": "diagnose_and_optimize" if optimize else "diagnose",
                 "offline_replay": "离线回放" in text or "offline replay" in text.casefold(),
             },
@@ -622,7 +700,7 @@ def _detect_fragment(text: str, context_snapshot: Any) -> list[RouteCandidate]:
         and not _has_email(text)
     )
     lab_query = _has_lab_query(text) or entity_fact_query
-    pending_query = _has_pending_query(text)
+    pending_query = _has_pending_query(text) and not _has_email(text)
     if pending_query:
         candidates.append(RouteCandidate(
             RouteKind.PENDING_QUERY, ReasonCode.PENDING_QUERY_MATCHED,
@@ -671,9 +749,12 @@ def _detect_fragment(text: str, context_snapshot: Any) -> list[RouteCandidate]:
             RiskLevel.LOW, text, target=target, entity_options=entities,
         ))
     if _has_email(text):
+        email_spec = parse_email_request(text)
         candidates.append(RouteCandidate(
             RouteKind.EMAIL, ReasonCode.EMAIL_MATCHED,
             RiskLevel.MEDIUM, text, target=target, entity_options=entities,
+            arguments=email_spec.to_dict(),
+            missing_fields=email_spec.missing_fields,
         ))
     if (
         ("传代" in text or "subculture" in text.casefold())
@@ -814,12 +895,65 @@ def detect_route_candidates(routing_input: RoutingInput) -> tuple[RouteCandidate
                 active_workflow_request=routing_input.active_workflow_request,
             )
         )
+    email_candidates = [item for item in candidates if item.kind == RouteKind.EMAIL]
+    if email_candidates and _has_email(routing_input.message.normalized_text):
+        full_email_spec = parse_email_request(routing_input.message.normalized_text)
+        candidates = [
+            replace(
+                item,
+                arguments=full_email_spec.to_dict(),
+                missing_fields=full_email_spec.missing_fields,
+                evidence=routing_input.message.original_text,
+            )
+            if item.kind == RouteKind.EMAIL
+            else item
+            for item in candidates
+            if not (
+                item.kind == RouteKind.PENDING_QUERY
+                and full_email_spec.create_approval
+            )
+        ]
     if not candidates:
         candidates.append(RouteCandidate(
             RouteKind.CHAT, ReasonCode.DEFAULT_CHAT, RiskLevel.NONE, text,
             target=_single_target(resolve_entities(routing_input)),
             entity_options=resolve_entities(routing_input),
         ))
+    scientific_candidates = [
+        item for item in candidates if item.kind == RouteKind.SCIENTIFIC_TASK
+    ]
+    if scientific_candidates:
+        from app.services.scientific.request_spec import parse_scientific_request
+
+        full_spec = parse_scientific_request(
+            routing_input.message.normalized_text,
+            has_target=any(
+                item.target and item.target.canonical_id
+                for item in scientific_candidates
+            ),
+        )
+        if full_spec.matched:
+            candidates = [
+                replace(
+                    item,
+                    arguments={
+                        **item.arguments,
+                        "candidate_count": (
+                            full_spec.candidate_count
+                            if full_spec.candidate_count is not None
+                            else item.arguments.get("candidate_count")
+                        ),
+                        "requested_capabilities": list(full_spec.capabilities),
+                        "source_policy": full_spec.source_policy,
+                        "simulation_policy": full_spec.simulation_policy,
+                        "budget_profile": full_spec.budget_profile,
+                        "seek_counterevidence": full_spec.seek_counterevidence,
+                    },
+                )
+                if item.kind == RouteKind.SCIENTIFIC_TASK
+                else item
+                for item in candidates
+            ]
     deduped: list[RouteCandidate] = []
     seen: set[tuple[Any, ...]] = set()
     for candidate in candidates:
@@ -922,7 +1056,11 @@ def _decision_from_candidate(
     if candidate.kind == RouteKind.TOOL_INFO:
         return ToolInfoDecision(explanation="The user asked about available tool capabilities.", **common)
     if candidate.kind == RouteKind.EMAIL:
-        return EmailDecision(explanation="The request contains an email action.", **common)
+        return EmailDecision(
+            explanation="The request contains an email action.",
+            request_spec=candidate.arguments,
+            **common,
+        )
     if candidate.kind in {RouteKind.LAB_QUERY, RouteKind.PENDING_QUERY}:
         return QueryDecision(
             kind=candidate.kind, query_type=candidate.query_type or "list_strains",
@@ -1064,14 +1202,76 @@ def _active_form_decision(
 ) -> RoutingDecision | None:
     if not routing_input.active_pending_form:
         return None
+    relation = parse_task_relation_signals(routing_input.message.normalized_text)
+    if relation.start_new and not relation.cancel_previous:
+        suspend_step = PendingFormDecision(
+            reason_code=ReasonCode.PENDING_FORM_CANCEL,
+            risk_level=RiskLevel.MEDIUM,
+            explanation="The user explicitly started a new task; suspend the active form.",
+            source_text=routing_input.message.normalized_text,
+            candidates=candidates,
+            form_action="suspend",
+        )
+        independent = tuple(
+            item
+            for item in candidates
+            if item.kind
+            in {
+                RouteKind.EMAIL,
+                RouteKind.LAB_QUERY,
+                RouteKind.PENDING_QUERY,
+                RouteKind.KNOWLEDGE_QUERY,
+                RouteKind.SCIENTIFIC_TASK,
+                RouteKind.TOOL_INFO,
+            }
+        )
+        if independent:
+            return CompositeDecision(
+                reason_code=ReasonCode.COMPOSITE_PLAN,
+                risk_level=_max_risk(independent),
+                explanation="Suspend the previous form, then handle the explicit new task.",
+                source_text=routing_input.message.original_text,
+                candidates=candidates,
+                steps=(
+                    suspend_step,
+                    *tuple(_decision_from_candidate(item) for item in independent),
+                ),
+            )
+        return suspend_step
     if _is_cancel(routing_input.message.normalized_text):
-        return PendingFormDecision(
+        cancel_step = PendingFormDecision(
             reason_code=ReasonCode.PENDING_FORM_CANCEL,
             risk_level=RiskLevel.MEDIUM,
             explanation="The user cancelled the active pending form.",
             source_text=routing_input.message.normalized_text,
             candidates=candidates, form_action="cancel",
         )
+        independent = tuple(
+            item for item in candidates
+            if item.kind in {
+                RouteKind.EMAIL,
+                RouteKind.LAB_QUERY,
+                RouteKind.PENDING_QUERY,
+                RouteKind.KNOWLEDGE_QUERY,
+                RouteKind.SCIENTIFIC_TASK,
+                RouteKind.TOOL_INFO,
+            }
+        )
+        if independent:
+            return CompositeDecision(
+                reason_code=ReasonCode.COMPOSITE_PLAN,
+                risk_level=_max_risk((RouteCandidate(
+                    kind=RouteKind.PENDING_FORM,
+                    reason_code=ReasonCode.PENDING_FORM_CANCEL,
+                    risk_level=RiskLevel.MEDIUM,
+                    evidence=routing_input.message.normalized_text,
+                ), *independent)),
+                explanation="Cancel the previous form, then handle the independent current request.",
+                source_text=routing_input.message.original_text,
+                candidates=candidates,
+                steps=(cancel_step, *tuple(_decision_from_candidate(item) for item in independent)),
+            )
+        return cancel_step
 
     proposals = [item for item in candidates if _candidate_effect(item) == EffectKind.PROPOSE]
     if proposals:
@@ -1127,8 +1327,44 @@ def _active_workflow_decision(
 ) -> RoutingDecision | None:
     if not routing_input.active_workflow_request:
         return None
+    relation = parse_task_relation_signals(routing_input.message.normalized_text)
+    if relation.start_new and not relation.cancel_previous:
+        suspend_step = WorkflowDecision(
+            reason_code=ReasonCode.WORKFLOW_REQUEST_CANCEL,
+            risk_level=RiskLevel.HIGH,
+            explanation="The user explicitly started a new task; suspend the active workflow request.",
+            source_text=routing_input.message.original_text,
+            candidates=candidates,
+            speech_act=SpeechAct.SUSPEND,
+        )
+        independent = tuple(
+            item
+            for item in candidates
+            if item.kind
+            in {
+                RouteKind.EMAIL,
+                RouteKind.LAB_QUERY,
+                RouteKind.PENDING_QUERY,
+                RouteKind.KNOWLEDGE_QUERY,
+                RouteKind.SCIENTIFIC_TASK,
+                RouteKind.TOOL_INFO,
+            }
+        )
+        if independent:
+            return CompositeDecision(
+                reason_code=ReasonCode.COMPOSITE_PLAN,
+                risk_level=_max_risk(independent),
+                explanation="Suspend the previous workflow, then handle the explicit new task.",
+                source_text=routing_input.message.original_text,
+                candidates=candidates,
+                steps=(
+                    suspend_step,
+                    *tuple(_decision_from_candidate(item) for item in independent),
+                ),
+            )
+        return suspend_step
     if _is_cancel(routing_input.message.normalized_text):
-        return WorkflowDecision(
+        cancel_step = WorkflowDecision(
             reason_code=ReasonCode.WORKFLOW_REQUEST_CANCEL,
             risk_level=RiskLevel.HIGH,
             explanation="The user cancelled the pre-approval workflow request.",
@@ -1136,6 +1372,27 @@ def _active_workflow_decision(
             candidates=candidates,
             speech_act=SpeechAct.CANCEL,
         )
+        independent = tuple(
+            item for item in candidates
+            if item.kind in {
+                RouteKind.EMAIL,
+                RouteKind.LAB_QUERY,
+                RouteKind.PENDING_QUERY,
+                RouteKind.KNOWLEDGE_QUERY,
+                RouteKind.SCIENTIFIC_TASK,
+                RouteKind.TOOL_INFO,
+            }
+        )
+        if independent:
+            return CompositeDecision(
+                reason_code=ReasonCode.COMPOSITE_PLAN,
+                risk_level=_max_risk(independent),
+                explanation="Cancel the previous workflow, then handle the independent current request.",
+                source_text=routing_input.message.original_text,
+                candidates=candidates,
+                steps=(cancel_step, *tuple(_decision_from_candidate(item) for item in independent)),
+            )
+        return cancel_step
     if len(candidates) == 1 and candidates[0].kind == RouteKind.CHAT:
         candidate = candidates[0]
         existing_targets = tuple(

@@ -29,6 +29,9 @@ def experiment_design_hash(payload: dict[str, Any]) -> str:
 @dataclass(frozen=True)
 class GoalContract:
     dataset_id: str
+    target_strain_id: str | None = None
+    dataset_version: str | None = None
+    dataset_content_hash: str | None = None
     target_metric: str = "biomass"
     direction: Literal["maximize", "minimize"] = "maximize"
     target_batch_ids: tuple[str, ...] = ()

@@ -10,7 +10,7 @@
 
 <p align="center">
   <img
-    src="public-assets/self-driving-lab-overview.png"
+    src="docs/assets/self-driving-lab-overview.png"
     alt="Algae Agent 微藻自驱动实验室自动化设备与数字孪生平台"
     width="100%"
   />
@@ -514,7 +514,7 @@ scripts/
 ├── run_agent_eval.py             原 Agent Runtime Eval
 └── run_algae_mcp.py              MCP stdio 入口
 
-public-assets/                   README figures and public project assets
+docs/                            01–12 主题文档与 Design_idea 深度设计分析
 tests/                           Runtime、RAG、Workflow、科学闭环和安全测试
 ```
 
@@ -522,9 +522,21 @@ tests/                           Runtime、RAG、Workflow、科学闭环和安�
 
 ## 📚 Documentation / 文档
 
-The extended design notes and internal project documents are kept in the private archive. This public release keeps the runnable source, tests, demos, and high-level README only.
-
-完整设计文档与内部项目资料保留在私有档案仓库中。公开版本仅保留可运行源码、测试、演示脚本和项目级 README。
+- [新项目总览：微藻自驱动实验室 Agent](docs/01_new_project_overview.md)
+- [原项目总览与改版提示](docs/01_project_overview.md)
+- [Runtime Graph](docs/02_runtime_graph.md)
+- [Decision 与科学任务路由](docs/03_decision.md)
+- [Context Engineering](docs/04_context.md)
+- [Context 设计分析](docs/Design_idea/02_context_design_analysis.md)
+- [Policy、Tools 与 Pending](docs/05_policy_tools_pending.md)
+- [Memory](docs/06_memory.md)
+- [Memory 设计分析](docs/Design_idea/03_memory_design_analysis.md)
+- [Workflow](docs/07_workflow.md)
+- [Hybrid Evidence RAG](docs/08_rag.md)
+- [Database、Audit 与 Trace](docs/09_database_audit_trace.md)
+- [Email 与 Notifications](docs/10_email_notifications.md)
+- [Frontend、API 与 Testing](docs/11_frontend_api_testing.md)
+- [Eval 与 Demo](docs/12_eval_demo.md)
 
 ---
 

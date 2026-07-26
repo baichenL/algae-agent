@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from copy import deepcopy
 from typing import Any
@@ -31,6 +32,13 @@ from app.services.scientific.models import (
     experiment_design_hash,
 )
 from app.services.scientific.optimizer import fit_response_surface, propose_conditions
+from app.services.scientific.proposal_gate import (
+    build_proposal_envelope,
+    evaluate_scientific_proposal,
+)
+from app.core.effects import stable_hash
+from app.core.time_utils import local_now, local_time_string
+import datetime
 
 
 def _event(run: dict[str, Any], event_type: str, payload: dict[str, Any]) -> None:
@@ -86,9 +94,16 @@ def _replay_split(dataset: dict[str, Any], run_seed: int) -> tuple[dict[str, Any
     return analysis_dataset, full
 
 
-def _retrieve_evidence(factor_names: list[str]) -> list[dict[str, Any]]:
+def _retrieve_evidence(
+    factor_names: list[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not factor_names:
-        return []
+        return [], {
+            "source": "rag",
+            "status": "empty",
+            "used": False,
+            "impact": "No modeled factors were available for evidence retrieval.",
+        }
     # Start with a language-neutral broad query, then query individual factor
     # tokens. A combined multilingual query can otherwise be rejected by the
     # evidence-sufficiency checker because one untranslated token is missing.
@@ -96,12 +111,17 @@ def _retrieve_evidence(factor_names: list[str]) -> list[dict[str, Any]]:
     questions.extend(f"microalgae algae growth {factor}" for factor in factor_names)
     citations: list[dict[str, Any]] = []
     seen: set[tuple[Any, Any]] = set()
+    failures = 0
+    completed_queries = 0
     for question in questions:
         try:
             response = answer_rag_question(RagQueryRequest(question=question, top_k=5, doc_types=["paper", "manual"]))
+            completed_queries += 1
         except Exception:
+            failures += 1
             continue
         if response.blocked:
+            failures += 1
             continue
         for item in response.citations:
             payload = item.model_dump()
@@ -110,8 +130,30 @@ def _retrieve_evidence(factor_names: list[str]) -> list[dict[str, Any]]:
                 seen.add(key)
                 citations.append(payload)
             if len(citations) >= 5:
-                return citations
-    return citations
+                break
+        if len(citations) >= 5:
+            break
+    if citations and failures:
+        status = "degraded"
+    elif citations:
+        status = "available"
+    elif failures:
+        status = "failed"
+    else:
+        status = "empty"
+    return citations, {
+        "source": "rag",
+        "status": status,
+        "used": bool(citations),
+        "query_count": len(questions),
+        "completed_queries": completed_queries,
+        "failed_queries": failures,
+        "impact": (
+            "Literature support is incomplete; conclusions remain data associations."
+            if status in {"failed", "degraded", "empty"}
+            else "Literature evidence contributed to hypothesis support."
+        ),
+    }
 
 
 def _verification(
@@ -233,6 +275,8 @@ def create_experiment_proposal(
     source: str = "scientific_runtime",
     agent_run_id: str | None = None,
     replay_split: dict[str, Any] | None = None,
+    proposal_version: int = 1,
+    created_by_tool_call_id: str | None = None,
 ) -> dict[str, Any]:
     design_payload = design.to_dict() if isinstance(design, ExperimentDesignSpec) else dict(design)
     claimed_hash = design_payload.get("design_hash")
@@ -240,6 +284,49 @@ def create_experiment_proposal(
     actual_hash = experiment_design_hash(unhashed)
     if claimed_hash != actual_hash:
         raise ValueError("design_hash_mismatch")
+    proposal_envelope: dict[str, Any] | None = None
+    proposal_hash: str | None = None
+    expected_versions: dict[str, Any] | None = None
+    expires_at = local_time_string(
+        local_now()
+        + datetime.timedelta(
+            seconds=max(60, int(os.getenv("PENDING_DEFAULT_TTL_SECONDS", "86400")))
+        )
+    )
+    if int(proposal_version) >= 2:
+        typed_design = _design_from_payload(design_payload)
+        run = scientific_db.get_scientific_run(scientific_run_id)
+        readiness, readiness_details = evaluate_scientific_proposal(
+            run=run,
+            design=typed_design,
+        )
+        if not readiness.ready:
+            return {
+                "status": "proposal_not_ready",
+                "scientific_run_id": scientific_run_id,
+                "missing_requirements": list(readiness.missing_requirements),
+                "conflicting_evidence": list(readiness.conflicting_evidence),
+                "suggested_next_investigations": list(
+                    readiness.suggested_next_investigations
+                ),
+            }
+        _artifact(
+            run,
+            "preproposal_simulation_report",
+            readiness_details["simulation"],
+        )
+        proposal_envelope = build_proposal_envelope(
+            run=run,
+            design=typed_design,
+            details=readiness_details,
+            expires_at=expires_at,
+            agent_run_id=agent_run_id,
+            tool_call_id=created_by_tool_call_id,
+        )
+        proposal_hash = stable_hash(proposal_envelope)
+        expected_versions = dict(
+            proposal_envelope.get("expected_resource_versions") or {}
+        )
     payload = {
         "type": "scientific_experiment_plan",
         "data": {
@@ -249,6 +336,7 @@ def create_experiment_proposal(
             "adapter_id": "offline-replay-v1" if replay_split and replay_split.get("hidden_batch_ids") else "sim-algae-lab-v1",
             "simulation_only": True,
             "replay_split": replay_split or {},
+            "proposal_hash": proposal_hash,
         },
     }
     pending_id = pending_actions.insert_pending_action(
@@ -260,6 +348,13 @@ def create_experiment_proposal(
         agent_run_id=agent_run_id,
         execution_idempotency_key=f"scientific:{scientific_run_id}:{actual_hash}",
         domain_dedupe_key=f"scientific-design:{scientific_run_id}:{actual_hash}",
+        expires_at=expires_at,
+        proposal_version=int(proposal_version),
+        proposal_hash=proposal_hash,
+        proposal_envelope=proposal_envelope,
+        policy_version=(proposal_envelope or {}).get("policy_version"),
+        expected_resource_versions=expected_versions,
+        created_by_tool_call_id=created_by_tool_call_id,
     )
     scientific_db.update_scientific_run(scientific_run_id, status="waiting_approval")
     return {
@@ -268,6 +363,9 @@ def create_experiment_proposal(
         "scientific_run_id": scientific_run_id,
         "design_hash": actual_hash,
         "simulation_only": True,
+        "proposal_version": int(proposal_version),
+        "proposal_hash": proposal_hash,
+        "expires_at": expires_at,
     }
 
 
@@ -302,6 +400,7 @@ def _prepare_next_design(
 def run_scientific_task(
     *,
     dataset_id: str,
+    target_strain_id: str | None = None,
     mode: str = "diagnose_and_optimize",
     target_metric: str | None = None,
     direction: str = "maximize",
@@ -316,11 +415,18 @@ def run_scientific_task(
     dataset = scientific_db.get_dataset(dataset_id)
     if not dataset:
         raise ValueError("scientific_dataset_not_found")
+    dataset_strain_id = str(dataset.get("strain_id") or "")
+    target_strain_id = str(target_strain_id or dataset_strain_id or "") or None
+    if target_strain_id and dataset_strain_id != target_strain_id:
+        raise ValueError("scientific_target_dataset_mismatch")
     metric = target_metric or str((dataset.get("mapping") or {}).get("metric_name") or "biomass")
     run_id = f"sci_{uuid.uuid4().hex[:16]}"
     trace_run_id = agent_run_id or start_run(session_id, f"scientific:{mode}:{dataset_id}")
     goal = GoalContract(
         dataset_id=dataset_id,
+        target_strain_id=target_strain_id,
+        dataset_version=str(dataset.get("created_at") or ""),
+        dataset_content_hash=str(dataset.get("content_hash") or ""),
         target_metric=metric,
         direction="minimize" if direction == "minimize" else "maximize",
         target_batch_ids=tuple(target_batch_ids or []),
@@ -348,13 +454,53 @@ def run_scientific_task(
     model = fit_response_surface(metrics)
     anomalies = detect_anomalies(metrics, model.get("residuals"))
     _observation(run, "anomaly", "scientific_anomaly_detection", {"anomalies": anomalies, "model_diagnostics": model})
-    evidence = _retrieve_evidence(model.get("factor_names") or [])
+    evidence, rag_status = _retrieve_evidence(model.get("factor_names") or [])
+    source_statuses = [
+        {
+            "source": "scientific_dataset",
+            "status": "available",
+            "used": True,
+            "dataset_id": dataset_id,
+            "strain_id": dataset_strain_id,
+            "content_hash": dataset.get("content_hash"),
+        },
+        rag_status,
+    ]
+    _artifact(run, "source_status", {"sources": source_statuses})
     _observation(run, "evidence", "scientific_evidence_search", {"citations": evidence}, evidence_refs=evidence, provenance="rag_read_only")
     diagnosis = build_diagnosis(
         anomalies=anomalies, quality=quality,
         factor_importance=model.get("factor_importance") or [], evidence=evidence,
     ).to_dict()
+    def enrich_result(result: dict[str, Any]) -> dict[str, Any]:
+        result.update({
+            "direct_answer": diagnosis.get("conclusion"),
+            "diagnosis": diagnosis,
+            "source_statuses": source_statuses,
+            "target_strain_id": target_strain_id,
+        })
+        return result
     _artifact(run, "diagnosis_report", diagnosis)
+    _artifact(
+        run,
+        "hypothesis_ledger",
+        {
+            "target_strain_id": target_strain_id,
+            "hypotheses": [
+                {
+                    **item,
+                    "status": "active",
+                    "supporting_evidence": item.get("evidence_refs") or [],
+                    "counterevidence": [],
+                    "confidence_history": [item.get("score")],
+                    "next_validation_action": (
+                        (item.get("limitations") or ["Run a controlled validation experiment."])[0]
+                    ),
+                }
+                for item in diagnosis.get("hypotheses") or []
+            ],
+        },
+    )
     _observation(run, "diagnosis", "scientific_hypothesis_ranking", diagnosis, evidence_refs=evidence)
 
     initial_verification = _verification(quality=quality, model=model, diagnosis=diagnosis, evidence=evidence)
@@ -363,7 +509,8 @@ def run_scientific_task(
         status = "succeeded" if initial_verification.verdict != "block" else "blocked"
         scientific_db.update_scientific_run(run_id, status=status)
         finish_run(trace_run_id, status=status, final_route="scientific_task", risk_level="low", response_summary=diagnosis["conclusion"])
-        return scientific_db.get_scientific_run(run_id) or {"id": run_id, "status": status}
+        result = scientific_db.get_scientific_run(run_id) or {"id": run_id, "status": status}
+        return enrich_result(result)
 
     design, design_context, patch = _prepare_next_design(
         run=run, dataset=analysis_dataset, goal=goal, metrics=metrics, evidence=evidence, excluded_conditions=[],
@@ -381,7 +528,10 @@ def run_scientific_task(
     })
     if design is None:
         scientific_db.update_scientific_run(run_id, status="blocked")
-        return scientific_db.get_scientific_run(run_id) or {"id": run_id, "status": "blocked"}
+        return enrich_result(
+            scientific_db.get_scientific_run(run_id)
+            or {"id": run_id, "status": "blocked"}
+        )
     if patch:
         _artifact(run, "plan_patch", patch.to_dict())
         plan.version = patch.new_version
@@ -396,7 +546,10 @@ def run_scientific_task(
     _artifact(run, "verification_report", final_verification.to_dict())
     if final_verification.verdict != "pass":
         scientific_db.update_scientific_run(run_id, status="blocked")
-        return scientific_db.get_scientific_run(run_id) or {"id": run_id, "status": "blocked"}
+        return enrich_result(
+            scientific_db.get_scientific_run(run_id)
+            or {"id": run_id, "status": "blocked"}
+        )
 
     proposal = None
     if create_pending:
@@ -409,7 +562,7 @@ def run_scientific_task(
         scientific_db.update_scientific_run(run_id, status="design_ready")
     result = scientific_db.get_scientific_run(run_id) or {"id": run_id}
     result["proposal"] = proposal
-    return result
+    return enrich_result(result)
 
 
 def _design_from_payload(payload: dict[str, Any]) -> ExperimentDesignSpec:
@@ -430,6 +583,7 @@ def approve_and_simulate_proposal(
     *,
     reviewed_by: str = "approver",
     idempotency_key: str | None = None,
+    finalize_pending: bool = True,
 ) -> dict[str, Any]:
     pending = pending_actions.get_pending_action(pending_id)
     if not pending:
@@ -561,5 +715,6 @@ def approve_and_simulate_proposal(
         "cycle_index": cycle,
         "next_pending": next_pending,
     }
-    pending_actions.mark_pending_executed(pending_id, response)
+    if finalize_pending:
+        pending_actions.mark_pending_executed(pending_id, response)
     return response

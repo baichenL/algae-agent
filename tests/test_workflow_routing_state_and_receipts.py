@@ -285,13 +285,19 @@ def test_workflow_approval_api_returns_202_and_run_id(
     monkeypatch,
 ):
     from app.api import strain as strain_api
+    from app.services import approval_execution_service
     pending_id = strain_service.create_pending_workflow_subculture("Chlorella_01")
     scheduled = []
 
     async def fake_background_execution(run_id):
         scheduled.append(run_id)
+        return {"status": "success", "run_id": run_id}
 
-    monkeypatch.setattr(strain_api, "execute_workflow_run", fake_background_execution)
+    monkeypatch.setattr(
+        approval_execution_service,
+        "execute_workflow_run",
+        fake_background_execution,
+    )
     app = FastAPI()
     app.include_router(strain_api.router, prefix="/api/v1")
     response = TestClient(app).post(

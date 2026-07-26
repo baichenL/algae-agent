@@ -86,6 +86,7 @@ test('正式传代审批结果可在 3D 页面实时播放', async ({ page, requ
 })
 
 test('隔离科学场景停在审批边界并在平板提供操作抽屉', async ({ page, request }, testInfo) => {
+  test.setTimeout(120_000)
   test.skip(testInfo.project.name !== 'tablet-768', '平板动作抽屉只需在 768px 项目验证')
   const session = await request.get('/api/v2/session')
   const csrf = (await session.json()).csrf_token

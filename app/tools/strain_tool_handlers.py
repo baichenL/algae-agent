@@ -60,6 +60,8 @@ def _require_more_info(action: str, missing_fields: list[str], questions: list[s
     side_effect="db_pending",
     requires_approval=True,
     allowed_callers=["chat_runtime", "frontend_form"],
+    exposed_to_llm=True,
+    executor_kind="proposal",
     idempotency_fields=["strain_id"],
     audit_event_type="strain_add_requested",
 )
@@ -105,6 +107,8 @@ def handle_add_strain_tool(function_args: Dict[str, Any]) -> Dict[str, Any]:
     side_effect="db_pending",
     requires_approval=True,
     allowed_callers=["chat_runtime", "frontend_form"],
+    exposed_to_llm=True,
+    executor_kind="proposal",
     idempotency_fields=["strain_id"],
     audit_event_type="strain_update_requested",
 )
@@ -154,6 +158,8 @@ def handle_update_strain_tool(function_args: Dict[str, Any]) -> Dict[str, Any]:
     side_effect="db_pending",
     requires_approval=True,
     allowed_callers=["chat_runtime", "frontend_form"],
+    exposed_to_llm=True,
+    executor_kind="proposal",
     idempotency_fields=["strain_id"],
     audit_event_type="strain_delete_requested",
 )
@@ -192,7 +198,11 @@ def handle_delete_strain_tool(function_args: Dict[str, Any]) -> Dict[str, Any]:
     effect_kind="read",
     side_effect="none",
     requires_approval=False,
-    allowed_callers=["chat_runtime", "frontend_form"],
+    allowed_callers=["chat_runtime", "frontend_form", "mcp_local"],
+    exposed_to_llm=True,
+    parallel_safe=True,
+    executor_kind="read",
+    result_authority="domain_fact",
     audit_event_type="strain_list_read",
 )
 def handle_list_strains_tool(function_args: Dict[str, Any]) -> Dict[str, Any]:
@@ -215,7 +225,11 @@ def handle_list_strains_tool(function_args: Dict[str, Any]) -> Dict[str, Any]:
     effect_kind="read",
     side_effect="none",
     requires_approval=False,
-    allowed_callers=["chat_runtime", "frontend_form"],
+    allowed_callers=["chat_runtime", "frontend_form", "mcp_local"],
+    exposed_to_llm=True,
+    parallel_safe=True,
+    executor_kind="read",
+    result_authority="control_state",
     audit_event_type="pending_list_read",
 )
 def handle_list_pending_tool(function_args: Dict[str, Any]) -> Dict[str, Any]:

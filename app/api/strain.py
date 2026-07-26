@@ -3,14 +3,14 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.schemas.algae import AddStrainRequest, ConfirmPendingRequest
+from app.core import database
 from app.core.db import workflow_runs
 from app.services.strains import strain_service
 from app.services.agent_runtime.approval_resume import review_pending_and_resume
 from app.services.workflows.workflow_approval_service import grant_workflow_approval
-from app.services.workflows.workflow_execution_service import execute_workflow_run
 from app.tools.executor import ToolExecutionContext, execute_registered_tool
 from app.core.security import ApiPrincipal, require_approver, require_scientist, require_viewer
-from app.services.scientific.service import approve_and_simulate_proposal
+from app.services.trusted_execution_dispatch import dispatch_trusted_execution
 
 router = APIRouter()
 
@@ -113,40 +113,67 @@ async def confirm_pending(
     principal: ApiPrincipal = Depends(require_approver),
 ):
     pending = strain_service.get_pending_action(payload.pending_id)
-    pending_type = ((pending or {}).get("payload") or {}).get("type")
-    if pending_type == "scientific_experiment_plan":
-        if payload.approve:
-            res = approve_and_simulate_proposal(payload.pending_id, reviewed_by=principal.name)
-            if res.get("status") == "success":
-                return JSONResponse(status_code=202, content=res)
-            raise HTTPException(status_code=422, detail=res.get("reason", "digital_twin_failed"))
-        from app.core.db import pending_actions as pending_db
-        from app.core.db import scientific as scientific_db
-        pending_db.update_pending_action_status(payload.pending_id, "denied", reviewed_by=principal.name)
-        run_id = ((((pending or {}).get("payload") or {}).get("data") or {}).get("scientific_run_id"))
-        if run_id:
-            scientific_db.update_scientific_run(str(run_id), status="denied")
-        return {"status": "success", "pending_id": payload.pending_id, "decision": "denied", "simulation_only": True}
-    if pending and pending.get("graph_thread_id"):
-        res = await review_pending_and_resume(payload.pending_id, approve=payload.approve)
-        if res.get("status") == "success":
-            return JSONResponse(status_code=202, content=res)
-        raise HTTPException(status_code=500, detail=res.get("reason", "operation_failed"))
-    if payload.approve:
-        if pending_type == "workflow_subculture":
-            res = grant_workflow_approval(payload.pending_id)
-            if res.get("status") == "success" and not res.get("idempotent"):
-                background_tasks.add_task(execute_workflow_run, res["run_id"])
-            if res.get("status") == "success":
-                return JSONResponse(status_code=202, content=res)
-        else:
-            res = await strain_service.approve_pending_action_async(payload.pending_id)
-    else:
-        res = strain_service.deny_pending_action(payload.pending_id)
-    if res.get("status") == "success":
-        return res
-    raise HTTPException(status_code=500, detail=res.get("reason", "操作失败"))
+    if not pending:
+        raise HTTPException(status_code=404, detail="pending_not_found")
+    governed_type = (pending.get("payload") or {}).get("type")
+    if not payload.approve:
+        governed_result = await review_pending_and_resume(
+            payload.pending_id,
+            approve=False,
+            reviewed_by=principal.name,
+        )
+        if governed_result.get("status") != "success":
+            raise HTTPException(
+                status_code=422,
+                detail=governed_result.get("reason", "denial_failed"),
+            )
+        if governed_type == "scientific_experiment_plan":
+            from app.core.db import scientific as scientific_db
 
+            governed_run_id = (
+                ((pending.get("payload") or {}).get("data") or {}).get("scientific_run_id")
+            )
+            if governed_run_id:
+                scientific_db.update_scientific_run(str(governed_run_id), status="denied")
+        return governed_result
+
+    governed_workflow_run_id = None
+    if governed_type == "workflow_subculture":
+        governed_result = grant_workflow_approval(
+            payload.pending_id,
+            reviewed_by=principal.name,
+        )
+        governed_workflow_run_id = governed_result.get("run_id")
+    else:
+        governed_result = await review_pending_and_resume(
+            payload.pending_id,
+            approve=True,
+            reviewed_by=principal.name,
+        )
+    if governed_result.get("status") != "success":
+        raise HTTPException(
+            status_code=422,
+            detail=governed_result.get("reason", "approval_failed"),
+        )
+    database.queue_pending_execution(payload.pending_id)
+    dispatch_trusted_execution(
+        background_tasks,
+        payload.pending_id,
+        (
+            int(governed_workflow_run_id)
+            if governed_workflow_run_id is not None
+            else None
+        ),
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            **governed_result,
+            "pending_id": payload.pending_id,
+            "decision": "approved",
+            "execution_scheduled": True,
+        },
+    )
 
 @router.get('/workflow-runs/{run_id}')
 async def get_workflow_run(run_id: int, _: ApiPrincipal = Depends(require_viewer)):

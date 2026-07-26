@@ -6,11 +6,12 @@ import sys
 def test_project_demo_script_runs_successfully():
     result = subprocess.run(
         [sys.executable, "scripts/run_project_demo.py"],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
 
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
     payload = json.loads(result.stdout)
     assert payload["status"] == "success"
     assert len(payload["demo_steps"]) == 3

@@ -52,6 +52,7 @@ def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
         ("collected_slots_json", "collected_slots", {}),
         ("missing_slots_json", "missing_slots", []),
         ("proposed_action_json", "proposed_action", None),
+        ("task_spec_json", "task_spec", None),
     ):
         item[public_name] = _json_load(item.pop(column, None), default)
     return item
@@ -122,6 +123,30 @@ def get_latest_task(conversation_id: str) -> dict[str, Any] | None:
         row = conn.execute(
             "SELECT * FROM conversation_tasks WHERE conversation_id = ? ORDER BY updated_at DESC LIMIT 1",
             (conversation_id,),
+        ).fetchone()
+    return _decode(row)
+
+
+def find_latest_task(
+    conversation_id: str,
+    *,
+    task_type: str,
+    owner: str | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, Any] | None:
+    clauses = ["conversation_id = ?", "task_type = ?"]
+    params: list[Any] = [conversation_id, task_type]
+    if owner is not None:
+        clauses.append("owner = ?")
+        params.append(owner)
+    if workspace_id is not None:
+        clauses.append("workspace_id = ?")
+        params.append(workspace_id)
+    with connect(row_factory=True) as conn:
+        row = conn.execute(
+            f"SELECT * FROM conversation_tasks WHERE {' AND '.join(clauses)} "
+            "ORDER BY updated_at DESC LIMIT 1",
+            params,
         ).fetchone()
     return _decode(row)
 
@@ -213,9 +238,11 @@ def create_task(
     collected_slots: dict[str, Any] | None = None,
     missing_slots: list[str] | None = None,
     proposed_action: dict[str, Any] | None = None,
+    task_spec: dict[str, Any] | None = None,
     pending_id: int | None = None,
     workflow_run_id: str | None = None,
     latest_agent_run_id: str | None = None,
+    parent_task_id: str | None = None,
     legacy_source: str | None = None,
     expires_at: str | None = None,
     task_id: str | None = None,
@@ -231,9 +258,10 @@ def create_task(
                 INSERT INTO conversation_tasks (
                     id, conversation_id, owner, workspace_id, task_type, goal_text, status,
                     state_changing, collected_slots_json, missing_slots_json, proposed_action_json,
-                    pending_id, workflow_run_id, latest_agent_run_id, version, legacy_source,
+                    task_spec_json, pending_id, workflow_run_id, latest_agent_run_id,
+                    parent_task_id, version, legacy_source,
                     created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -247,9 +275,11 @@ def create_task(
                     _json_dump(collected_slots or {}),
                     _json_dump(missing_slots or []),
                     _json_dump(proposed_action) if proposed_action is not None else None,
+                    _json_dump(task_spec) if task_spec is not None else None,
                     pending_id,
                     workflow_run_id,
                     latest_agent_run_id,
+                    parent_task_id,
                     legacy_source,
                     now,
                     now,
@@ -286,11 +316,15 @@ def update_task(task_id: str, *, expected_version: int | None = None, event_type
         "latest_agent_run_id",
         "expires_at",
         "completed_at",
+        "parent_task_id",
+        "superseded_by_task_id",
+        "pause_reason",
     }
     json_columns = {
         "collected_slots": "collected_slots_json",
         "missing_slots": "missing_slots_json",
         "proposed_action": "proposed_action_json",
+        "task_spec": "task_spec_json",
     }
     assignments: list[str] = []
     params: list[Any] = []
@@ -342,6 +376,48 @@ def cancel_task(task_id: str, *, reason: str = "cancelled_by_user") -> dict[str,
     if task["status"] in TERMINAL_STATUSES:
         return task
     return update_task(task_id, expected_version=int(task["version"]), status="cancelled", event_type="task_cancelled", proposed_action={**(task.get("proposed_action") or {}), "cancel_reason": reason})
+
+
+def suspend_task(
+    task_id: str,
+    *,
+    superseded_by_task_id: str | None = None,
+) -> dict[str, Any]:
+    task = get_task(task_id)
+    if task is None:
+        raise KeyError(task_id)
+    if task["status"] in TERMINAL_STATUSES or task["status"] == "suspended":
+        return task
+    return update_task(
+        task_id,
+        expected_version=int(task["version"]),
+        status="suspended",
+        state_changing=False,
+        superseded_by_task_id=superseded_by_task_id,
+        event_type="task_suspended",
+    )
+
+
+def pause_task(
+    task_id: str,
+    *,
+    reason: str,
+    proposed_action: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    task = get_task(task_id)
+    if task is None:
+        raise KeyError(task_id)
+    return update_task(
+        task_id,
+        expected_version=int(task["version"]),
+        status="paused",
+        state_changing=False,
+        pause_reason=reason,
+        proposed_action=(
+            proposed_action if proposed_action is not None else task.get("proposed_action")
+        ),
+        event_type="task_paused",
+    )
 
 
 def graph_thread_id(task_id: str) -> str:

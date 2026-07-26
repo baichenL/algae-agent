@@ -25,6 +25,10 @@ class ToolExecutionContext:
     agent_run_id: str | None = None
     approval_id: int | None = None
     source: str | None = None
+    principal_id: str | None = None
+    workspace_id: str | None = None
+    role: str | None = None
+    tool_call_id: str | None = None
 
     def to_event_payload(self) -> dict[str, Any]:
         return {
@@ -33,6 +37,10 @@ class ToolExecutionContext:
             "agent_run_id": self.agent_run_id,
             "approval_id": self.approval_id,
             "source": self.source,
+            "principal_id": self.principal_id,
+            "workspace_id": self.workspace_id,
+            "role": self.role,
+            "tool_call_id": self.tool_call_id,
         }
 
 
@@ -89,6 +97,8 @@ def _args_with_context(
         args["agent_run_id"] = context.agent_run_id
     if context.approval_id and not args.get("approval_id"):
         args["approval_id"] = context.approval_id
+    if context.tool_call_id and not args.get("created_by_tool_call_id"):
+        args["created_by_tool_call_id"] = context.tool_call_id
     return args
 
 
@@ -276,6 +286,34 @@ def _authorize_tool_call(
             },
         )
         return _blocked_result(tool_name, f"Caller is not allowed to invoke tool: {tool_name}", error_event_id)
+
+    allowed_roles = {str(item).lower() for item in metadata.get("allowed_roles") or []}
+    if allowed_roles and (context.role or "").lower() not in allowed_roles:
+        error_event_id = _record_tool_error(
+            tool_name,
+            function_args,
+            operation="authorize_tool",
+            error_type="ToolRoleNotAllowed",
+            message=f"Role {context.role or 'unknown'} is not allowed to invoke tool {tool_name}",
+            severity="warning",
+            metadata={"allowed_roles": sorted(allowed_roles), "context": context.to_event_payload()},
+        )
+        return _blocked_result(tool_name, f"Role is not allowed to invoke tool: {tool_name}", error_event_id)
+
+    if context.workspace_id:
+        from app.core.workspaces import current_workspace
+
+        if current_workspace().id != context.workspace_id:
+            error_event_id = _record_tool_error(
+                tool_name,
+                function_args,
+                operation="authorize_tool",
+                error_type="CrossWorkspaceToolCallBlocked",
+                message="Tool execution context does not match the active workspace",
+                severity="warning",
+                metadata={"context": context.to_event_payload()},
+            )
+            return _blocked_result(tool_name, "Cross-workspace tool call is forbidden", error_event_id)
 
     effect_kind = metadata.get("effect_kind")
     risk_level = metadata.get("risk_level")

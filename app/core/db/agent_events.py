@@ -211,6 +211,7 @@ def finish_agent_run(
                 UPDATE agent_runs
                 SET
                     status = ?,
+                    checkpoint_status = ?,
                     finished_at = ?,
                     final_route = COALESCE(?, final_route),
                     risk_level = COALESCE(?, risk_level),
@@ -219,6 +220,7 @@ def finish_agent_run(
                 WHERE id = ?
                 """,
                 (
+                    status,
                     status,
                     local_time_string(),
                     final_route,

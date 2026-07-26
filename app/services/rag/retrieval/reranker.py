@@ -48,7 +48,20 @@ class NoOpReranker:
 
     def rerank(self, query: RetrievalQuery, hits: list[RetrievalHit]) -> list[RetrievalHit]:
         return [
-            hit.model_copy(update={"rerank_score": hit.fusion_score or 0.0, "final_rank": index})
+            hit.model_copy(
+                update={
+                    "rerank_score": hit.fusion_score or 0.0,
+                    "final_rank": index,
+                    "metadata": {
+                        **hit.metadata,
+                        "rerank_components": {
+                            "backend": "noop",
+                            "fusion_score": hit.fusion_score or 0.0,
+                            "total": hit.fusion_score or 0.0,
+                        },
+                    },
+                }
+            )
             for index, hit in enumerate(hits, start=1)
         ]
 

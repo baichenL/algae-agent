@@ -6,6 +6,7 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, Field, Extra, ValidationError
 
 from app.core import config
+from app.core.model_registry import model_name
 from app.core.database import get_experiment_by_id, get_experiments_by_strain, insert_reflection_rule
 
 
@@ -83,7 +84,7 @@ async def analyze_and_store_reflection(experiment_id: int):
         # call LLM in thread to avoid blocking
         def call_llm():
             response = config.client.chat.completions.create(
-                model="deepseek-chat",
+                model=model_name("reflection"),
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}

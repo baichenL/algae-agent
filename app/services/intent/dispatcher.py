@@ -70,6 +70,7 @@ async def _dispatch_email(decision: EmailDecision, ctx: DispatchContext) -> Chat
             ctx.context_snapshot,
             ctx.tool_executor,
             ctx.agent_run_id,
+            decision.request_spec,
         )
     except TypeError:
         # Backward compatibility for tests or callers monkeypatching the legacy
@@ -205,6 +206,171 @@ async def _dispatch_scientific(decision: ScientificTaskDecision, ctx: DispatchCo
     )
 
 
+async def _dispatch_scientific_v2(
+    decision: ScientificTaskDecision,
+    ctx: DispatchContext,
+) -> ChatResponse:
+    """Target-bound scientific dispatch with partial-source disclosure."""
+    from app.services.scientific.service import run_scientific_task
+
+    target_strain_id = decision.arguments.get("target_strain_id")
+    if decision.arguments.get("target_dataset_mismatch"):
+        return _complete_chat_response(
+            ctx.session_id,
+            ctx.conversation_history,
+            {
+                "agent_output": {
+                    "action": "scientific_target_dataset_mismatch",
+                    "status": "needs_more_info",
+                    "outcome_status": "needs_input",
+                    "target_strain_id": target_strain_id,
+                    "missing_fields": ["matching_dataset_id"],
+                },
+                "natural_reply": (
+                    f"请求目标是 {target_strain_id}，但指定数据集属于另一菌株。"
+                    "为避免跨菌株污染，我没有使用该数据集；请提供与目标匹配的数据集。"
+                ),
+            },
+        )
+
+    if not decision.arguments.get("dataset_id") and target_strain_id:
+        from app.core.db import experiments, strains
+
+        strain = strains.get_algae_status(str(target_strain_id))
+        history = experiments.get_recent_experiments(
+            strain=str(target_strain_id),
+            limit=20,
+        )
+        facts: list[str] = []
+        if strain:
+            facts.append(
+                f"当前代数 {strain.get('generation_number')}，距上次传代 "
+                f"{strain.get('days_since_last_subculture')} 天"
+            )
+        if history:
+            facts.append(f"找到 {len(history)} 条实验历史")
+        source_statuses = [
+            {
+                "source": "strain_state",
+                "status": "available" if strain else "empty",
+                "used": bool(strain),
+            },
+            {
+                "source": "experiment_history",
+                "status": "available" if history else "empty",
+                "used": bool(history),
+            },
+            {
+                "source": "scientific_dataset",
+                "status": "empty",
+                "used": False,
+                "impact": "缺少同一菌株的生长时序数据，无法判断趋势或仿真候选。",
+            },
+        ]
+        return _complete_chat_response(
+            ctx.session_id,
+            ctx.conversation_history,
+            {
+                "agent_output": {
+                    "action": "scientific_partial",
+                    "status": "partial",
+                    "outcome_status": "partial",
+                    "target_strain_id": target_strain_id,
+                    "confirmed_facts": facts,
+                    "source_statuses": source_statuses,
+                    "unknowns": ["生长趋势、异常幅度和候选原因"],
+                    "remaining_work": ["导入或指定该菌株的 ready 生长数据集"],
+                },
+                "natural_reply": (
+                    f"我没有找到与 {target_strain_id} 匹配的 ready 生长数据集，"
+                    "因此没有借用其他菌株数据。"
+                    + (f"目前能确认：{'；'.join(facts)}。" if facts else "")
+                    + "缺少同一菌株的生长时序数据，暂时不能可靠判断趋势、异常原因或完成仿真。"
+                ),
+            },
+        )
+
+    if decision.missing_fields or not decision.arguments.get("dataset_id"):
+        return _complete_chat_response(
+            ctx.session_id,
+            ctx.conversation_history,
+            {
+                "agent_output": {
+                    "action": "scientific_dataset_required",
+                    "status": "needs_more_info",
+                    "outcome_status": "needs_input",
+                    "missing_fields": ["dataset_id"],
+                },
+                "natural_reply": "请导入生长数据，或提供目标菌株及其匹配的 dataset_id。",
+            },
+        )
+
+    result = run_scientific_task(
+        dataset_id=decision.arguments["dataset_id"],
+        target_strain_id=target_strain_id,
+        mode=decision.arguments.get("mode") or "diagnose",
+        offline_replay=bool(decision.arguments.get("offline_replay")),
+        session_id=ctx.session_id,
+        agent_run_id=ctx.agent_run_id,
+        create_pending=(decision.arguments.get("mode") == "diagnose_and_optimize"),
+    )
+    proposal = result.get("proposal") or {}
+    source_statuses = result.get("source_statuses") or []
+    degraded = [
+        item for item in source_statuses
+        if item.get("status") in {"failed", "degraded", "empty"}
+    ]
+    diagnosis = result.get("diagnosis") or {}
+    hypotheses = diagnosis.get("hypotheses") or []
+    lead = hypotheses[0] if hypotheses else None
+    outcome_status = (
+        "pending"
+        if proposal.get("pending_id")
+        else "partial" if degraded else "success"
+    )
+    output = {
+        "action": "scientific_closed_loop",
+        "status": "pending" if proposal.get("pending_id") else outcome_status,
+        "outcome_status": outcome_status,
+        "scientific_run_id": result.get("id"),
+        "pending_id": proposal.get("pending_id"),
+        "require_confirmation": bool(proposal.get("pending_id")),
+        "simulation_only": True,
+        "artifact_count": len(result.get("artifacts") or []),
+        "target_strain_id": result.get("target_strain_id"),
+        "direct_answer": result.get("direct_answer"),
+        "confirmed_facts": diagnosis.get("anomalies") or [],
+        "inferences": hypotheses,
+        "source_statuses": source_statuses,
+    }
+    reply = (
+        f"已完成对 {result.get('target_strain_id') or target_strain_id or '目标菌株'} 的分析："
+        f"检测到 {len(diagnosis.get('anomalies') or [])} 个异常信号。"
+    )
+    if lead:
+        reply += (
+            f"当前首要候选是 {lead.get('candidate_cause')}（支持分数 "
+            f"{float(lead.get('score') or 0):.2f}），它是待验证关联，不是已证实因果。"
+        )
+    if degraded:
+        reply += " 数据源限制：" + "；".join(
+            f"{item.get('source')}={item.get('status')}，"
+            f"{item.get('impact') or '未用于结论'}"
+            for item in degraded
+        ) + "。"
+    if proposal.get("pending_id"):
+        reply += (
+            f" 已创建仿真方案审批 pending {proposal.get('pending_id')}；"
+            "批准前不会执行任何后续动作。"
+        )
+    reply += f"可在 scientific run {result.get('id')} 查看完整证据与 Trace。"
+    return _complete_chat_response(
+        ctx.session_id,
+        ctx.conversation_history,
+        {"agent_output": output, "natural_reply": reply},
+    )
+
+
 async def _dispatch_clarification(
     decision: ClarificationDecision,
     ctx: DispatchContext,
@@ -282,7 +448,10 @@ async def _dispatch_composite(
 
     step_payloads = [
         {
-            "route_kind": step.kind.value,
+            # LangGraph checkpoint serialization may round-trip a str Enum as
+            # its string value.  Composite execution must remain stable across
+            # that boundary.
+            "route_kind": str(getattr(step.kind, "value", step.kind)),
             "action": response.agent_output.get("action"),
             "status": response.agent_output.get("status", response.status),
             "agent_output": response.agent_output,
@@ -319,7 +488,7 @@ _HANDLERS = {
     RouteKind.WRITE_ACTION: _dispatch_write,
     RouteKind.WORKFLOW: _dispatch_workflow,
     RouteKind.WORKFLOW_AUDIT: _dispatch_workflow_audit,
-    RouteKind.SCIENTIFIC_TASK: _dispatch_scientific,
+    RouteKind.SCIENTIFIC_TASK: _dispatch_scientific_v2,
     RouteKind.CLARIFICATION: _dispatch_clarification,
     RouteKind.CHAT: _dispatch_chat,
     RouteKind.COMPOSITE: _dispatch_composite,

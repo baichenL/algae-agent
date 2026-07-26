@@ -12,14 +12,14 @@ def toolset_for_context(context: RuntimeRequestContext | None) -> dict[str, Any]
     role = (context.role if context else "scientist").strip().lower()
     allowed_effects = {
         "viewer": {"read"},
-        "scientist": {"read", "draft", "propose"},
-        "approver": {"read", "draft", "propose"},
+        "scientist": {"read", "compute", "draft", "propose"},
+        "approver": {"read", "compute", "draft", "propose"},
     }.get(role, {"read"})
     tools: list[dict[str, Any]] = []
     for name, definition in sorted(AGENT_TOOL_REGISTRY.items()):
         metadata = definition.get("metadata") or definition
         effect = str(metadata.get("effect_kind") or "read")
-        if not metadata.get("exposed_to_llm", True) or effect not in allowed_effects:
+        if not metadata.get("exposed_to_llm", False) or effect not in allowed_effects:
             continue
         tools.append(
             {

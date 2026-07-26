@@ -14,6 +14,7 @@ class AgentTerminalStatus(str, Enum):
     FAILED = "failed"
     BLOCKED = "blocked"
     MAX_STEPS_REACHED = "max_steps_reached"
+    PAUSED = "paused"
 
 
 @dataclass(frozen=True)
@@ -418,6 +419,21 @@ class AgentRunState:
     dynamic_plan_count: int = 0
     max_dynamic_replans: int = 2
     planning_context: dict[str, Any] = field(default_factory=dict)
+    agentic_state_schema_version: int = 2
+    agentic_mode: str | None = None
+    safety_envelope: dict[str, Any] = field(default_factory=dict)
+    resolved_tools: list[dict[str, Any]] = field(default_factory=list)
+    v2_observations: list[dict[str, Any]] = field(default_factory=list)
+    hypotheses: list[dict[str, Any]] = field(default_factory=list)
+    candidate_plans: list[dict[str, Any]] = field(default_factory=list)
+    model_turn_count: int = 0
+    tool_call_count: int = 0
+    compute_call_count: int = 0
+    proposal_count: int = 0
+    plan_patch_count: int = 0
+    cumulative_model_tokens: int = 0
+    agentic_started_at: float | None = None
+    last_model_action: dict[str, Any] = field(default_factory=dict)
     terminal_status: AgentTerminalStatus | None = None
     final_response: ChatResponse | None = None
     last_error: dict[str, Any] | str | None = None

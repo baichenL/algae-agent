@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from contextlib import nullcontext
 from datetime import datetime
@@ -13,9 +14,10 @@ from pydantic import BaseModel, Field
 
 from app.core import database
 from app.core.config import load_memory
+from app.core.model_registry import classify_provider_error
 from app.core.db import schema as db_schema
 from app.core.db import scientific as scientific_db
-from app.core.db import assistant_conversations, conversation_tasks, operations
+from app.core.db import assistant_conversations, conversation_tasks, operations, workflow_runs
 from app.core.session_security import (
     SESSION_COOKIE,
     create_browser_session,
@@ -32,15 +34,15 @@ from app.services.chat.chat_service import handle_chat
 from app.services.user_memory.service import process_completed_turn
 from app.services.agent_runtime.state import RuntimeRequestContext
 from app.services.control_plane import dashboard, get_events, get_run, list_approvals, list_runs
-from app.services.scientific.service import approve_and_simulate_proposal, run_scientific_task
+from app.services.scientific.service import run_scientific_task
 from app.services.rag.service import answer_rag_question
 from app.services.rag.knowledge_asset_service import index_source, list_sources, save_uploaded_source
 from app.services.rag.generation_service import activate_generation, build_shadow_generation
 from app.services.strains import strain_service
 from app.services.workflows.simulation_service import simulation_runs
 from app.services.workflows.workflow_approval_service import grant_workflow_approval
-from app.services.workflows.workflow_execution_service import execute_workflow_run
-from app.services.approval_execution_service import execute_approved_pending
+from app.services.proposal_execution_validation import validate_pending_for_execution
+from app.services.trusted_execution_dispatch import dispatch_trusted_execution
 from app.services.scientific.demo_data import scientific_demo_file
 from app.services.scientific.importer import DatasetImportError, parse_scientific_dataset
 from app.core.workspaces import (
@@ -58,6 +60,22 @@ from app.core.workspaces import (
 
 
 router = APIRouter(prefix="/api/v2", tags=["control-plane-v2"])
+
+
+def _dispatch_trusted_execution(
+    background_tasks: BackgroundTasks,
+    approval_id: int,
+    workflow_run_id: int | None = None,
+    workspace: WorkspaceContext | None = None,
+    operation_id: str | None = None,
+) -> None:
+    dispatch_trusted_execution(
+        background_tasks,
+        approval_id,
+        workflow_run_id,
+        workspace,
+        operation_id,
+    )
 
 
 class LoginRequest(BaseModel):
@@ -205,20 +223,64 @@ async def _process_assistant_message(
                 pass
         except Exception as exc:
             message = str(exc) or exc.__class__.__name__
+            failure = classify_provider_error(exc)
+            active_task = conversation_tasks.get_active_task(
+                conversation_id,
+                owner=owner,
+                workspace_id=workspace.id,
+            )
+            if not active_task:
+                latest_task = conversation_tasks.get_latest_task(conversation_id)
+                if (
+                    latest_task
+                    and latest_task.get("owner") == owner
+                    and latest_task.get("workspace_id") == workspace.id
+                    and latest_task.get("status")
+                    not in conversation_tasks.TERMINAL_STATUSES
+                ):
+                    active_task = latest_task
+            failed_task_id = None
+            if active_task and active_task.get("status") not in conversation_tasks.TERMINAL_STATUSES:
+                try:
+                    failed_task = conversation_tasks.update_task(
+                        active_task["id"],
+                        status="failed",
+                        proposed_action={
+                            **(active_task.get("proposed_action") or {}),
+                            "failure": {
+                                "code": failure["code"],
+                                "category": failure["category"],
+                                "error_type": type(exc).__name__,
+                            },
+                        },
+                        event_type="task_failed",
+                    )
+                    failed_task_id = failed_task["id"]
+                except Exception:
+                    failed_task_id = active_task.get("id")
             assistant_conversations.update_message(
                 assistant_message_id,
-                content=f"处理失败：{message}",
+                content=failure["public_message"],
                 status="failed",
                 operation_id=operation_id,
+                structured={
+                    "action": "assistant_error",
+                    "outcome_status": "failed",
+                    "error_code": failure["code"],
+                    "error_category": failure["category"],
+                    "retryable": failure["retryable"],
+                    "task_id": failed_task_id,
+                },
             )
             operations.update_operation(
                 operation_id,
                 status="failed",
                 phase="failed",
                 message="回复生成失败",
-                error_code=exc.__class__.__name__,
+                error_code=failure["code"],
                 error_message=message,
-                retryable=True,
+                retryable=failure["retryable"],
+                related_task_id=failed_task_id,
             )
 
 
@@ -755,8 +817,8 @@ async def operation_retry(
             progress=0.0,
             retryable=True,
         )
-        background_tasks.add_task(
-            execute_approved_pending,
+        _dispatch_trusted_execution(
+            background_tasks,
             approval_id,
             metadata.get("workflow_run_id"),
             current_workspace(),
@@ -937,8 +999,8 @@ async def approval_decision(
                     metadata={"approval_id": approval_id, "workflow_run_id": int(result["run_id"])},
                     retryable=True,
                 )
-                background_tasks.add_task(
-                    execute_approved_pending,
+                _dispatch_trusted_execution(
+                    background_tasks,
                     approval_id,
                     int(result["run_id"]),
                     owner,
@@ -966,7 +1028,9 @@ async def approval_decision(
                 related_run_id=f"scientific:{source_id}", related_entity_type="approval",
                 related_entity_id=str(approval_id), metadata={"approval_id": approval_id}, retryable=True,
             )
-            background_tasks.add_task(execute_approved_pending, approval_id, None, owner, operation["id"])
+            _dispatch_trusted_execution(
+                background_tasks, approval_id, None, owner, operation["id"]
+            )
             return {"status": "success", "decision": "approved", "approval_id": approval_id, "run_id": f"scientific:{source_id}", "execution_scheduled": True, "operation_id": operation["id"], "operation": operation}
         if pending_type in {"add_strain", "update_strain", "delete_strain"}:
             database.queue_pending_execution(approval_id)
@@ -978,7 +1042,9 @@ async def approval_decision(
                 related_entity_type="approval", related_entity_id=str(approval_id),
                 metadata={"approval_id": approval_id}, retryable=True,
             )
-            background_tasks.add_task(execute_approved_pending, approval_id, None, owner, operation["id"])
+            _dispatch_trusted_execution(
+                background_tasks, approval_id, None, owner, operation["id"]
+            )
             return {"status": "success", "decision": "approved", "approval_id": approval_id, "run_id": f"agent:{pending.get('agent_run_id')}" if pending.get("agent_run_id") else None, "execution_scheduled": True, "operation_id": operation["id"], "operation": operation}
         return {"status": "success", "decision": "approved", "approval_id": approval_id, "run_id": f"agent:{pending.get('agent_run_id')}" if pending.get("agent_run_id") else None, "execution_scheduled": False}
 
@@ -996,7 +1062,7 @@ async def retry_approval_execution(
         raise HTTPException(status_code=409, detail="approval_not_retryable")
     database.mark_pending_execution_failed(approval_id, "manual_retry")
     database.queue_pending_execution(approval_id)
-    background_tasks.add_task(execute_approved_pending, approval_id)
+    _dispatch_trusted_execution(background_tasks, approval_id)
     return {"status": "success", "approval_id": approval_id, "execution_scheduled": True}
 
 
@@ -1004,6 +1070,7 @@ async def retry_approval_execution(
 async def execute_run(
     run_id: str,
     payload: ExecuteRequest,
+    background_tasks: BackgroundTasks,
     principal: ApiPrincipal = Depends(require_session_approver),
 ):
     owner = workspace_for_run(run_id)
@@ -1012,38 +1079,47 @@ async def execute_run(
         if not detail:
             raise HTTPException(status_code=404, detail="run_not_found")
         kind, source_id = run_id.split(":", 1)
-        if kind == "scientific":
-            replayed = next(
-                (
-                    item for item in detail.get("approvals") or []
-                    if item.get("executed_at")
-                    and (item.get("execution_result") or {}).get("idempotency_key") == payload.idempotency_key
-                ),
-                None,
-            )
-            if replayed:
-                return {
-                    "status": "success", "run_id": run_id,
-                    "execution": {**replayed["execution_result"], "idempotent": True},
-                }
-            latest = (detail.get("approvals") or [None])[0]
-            if not latest or latest.get("status") != "approved":
-                raise HTTPException(status_code=409, detail="approved_plan_required")
-            result = approve_and_simulate_proposal(
-                int(latest["id"]), reviewed_by=principal.name, idempotency_key=payload.idempotency_key,
-            )
-        elif kind == "workflow":
-            result = await execute_workflow_run(int(source_id))
-        elif kind == "agent":
-            latest = (detail.get("approvals") or [None])[0]
-            if not latest or latest.get("status") != "approved":
-                raise HTTPException(status_code=409, detail="approved_action_required")
-            result = await strain_service.execute_approved_pending_action(int(latest["id"]))
-        else:
+        if kind not in {"scientific", "workflow", "agent"}:
             raise HTTPException(status_code=422, detail="run_not_executable")
-        if result.get("status") != "success":
-            raise HTTPException(status_code=422, detail=result)
-        return {"status": "success", "run_id": run_id, "execution": result}
+        workflow_run_id = None
+        if kind == "workflow":
+            workflow = workflow_runs.get_workflow_run(int(source_id))
+            latest = database.get_pending_action(int(workflow["pending_id"])) if workflow else None
+            workflow_run_id = int(source_id)
+        else:
+            latest = (detail.get("approvals") or [None])[0]
+        if latest and latest.get("status") == "stale":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": latest.get("execution_error") or "proposal_stale"
+                },
+            )
+        if not latest or latest.get("status") != "approved":
+            raise HTTPException(status_code=409, detail="approved_proposal_required")
+        invalid_reason = validate_pending_for_execution(latest)
+        if invalid_reason:
+            database.mark_pending_stale(int(latest["id"]), invalid_reason)
+            raise HTTPException(status_code=422, detail={"reason": invalid_reason})
+        if latest.get("execution_status") == "unknown":
+            raise HTTPException(status_code=409, detail="execution_unknown_requires_manual_reconciliation")
+        database.queue_pending_execution(int(latest["id"]))
+        _dispatch_trusted_execution(
+            background_tasks,
+            int(latest["id"]),
+            workflow_run_id,
+            owner,
+        )
+        return {
+            "status": "success",
+            "run_id": run_id,
+            "execution": {
+                "status": "queued",
+                "pending_id": int(latest["id"]),
+                "idempotency_key": payload.idempotency_key,
+                "canonical_execution_pending": True,
+            },
+        }
 
 
 @router.post("/runs/{run_id:path}/manual-tasks/{task_id}/resolve")
@@ -1120,6 +1196,114 @@ async def manual_commit_workflow(
         )
     operations.update_operation(operation["id"], status="succeeded", phase="completed", message="资源、实验和审计记录已更新", progress=1.0, retryable=False)
     return {"status": "success", "run_id": run_id, "operation_id": operation["id"], "operation": operations.get_operation(operation["id"]), **result}
+
+
+@router.post("/test-scenarios/assistant-presentation", status_code=201)
+async def create_assistant_presentation_scenario(
+    principal: ApiPrincipal = Depends(require_session_scientist),
+):
+    """Seed deterministic UI content, available only under explicit test auth."""
+    if os.getenv("ALGAE_AUTH_MODE", "").strip().casefold() != "test":
+        raise HTTPException(status_code=404, detail="scenario_not_found")
+    workspace = current_workspace()
+    conversation = assistant_conversations.create_conversation(
+        principal.name,
+        workspace_id=workspace.id,
+        title="Assistant presentation UAT",
+    )
+    task = conversation_tasks.create_task(
+        conversation_id=conversation["id"],
+        owner=principal.name,
+        workspace_id=workspace.id,
+        goal_text="为 Chlamydomonas_01 准备邮件草稿并比较两个科学候选",
+        task_type="email",
+        status="collecting",
+        state_changing=True,
+        collected_slots={"target": "Chlamydomonas_01"},
+        missing_slots=["recipient"],
+        proposed_action={
+            "available_actions": ["补充收件人", "取消任务"],
+            "developer_only": {"checkpoint": "scenario-checkpoint"},
+        },
+    )
+    assistant_conversations.append_message(
+        conversation["id"],
+        role="assistant",
+        content=(
+            "# 调查结论\n\n"
+            "- 已生成两个候选\n"
+            "- 邮件仍是草稿，**尚未发送**\n\n"
+            "| 候选 | 风险 |\n| --- | --- |\n| A | 低 |\n| B | 中 |\n\n"
+            "```text\nsimulation_only\n```"
+        ),
+        status="completed",
+        task_id=task["id"],
+        structured={
+            "action": "email_draft",
+            "status": "paused",
+            "send": False,
+            "answer_envelope": {
+                "schema_version": "answer-envelope/v2",
+                "outcome_status": "paused",
+                "direct_answer": "调查结论",
+                "confirmed_facts": [],
+                "inferences": [],
+                "simulation_results": [],
+                "recommendations": [],
+                "unknowns": [],
+                "source_statuses": [],
+                "completed_work": {"candidate_count": 2},
+                "remaining_work": ["补充收件人"],
+                "budget": {},
+                "references": [],
+                "next_actions": [],
+                "presentation_blocks": [
+                    {
+                        "type": "email_draft",
+                        "target": "Chlamydomonas_01",
+                        "send": False,
+                        "draft": {
+                            "subject": "检查提醒",
+                            "body": "请检查 Chlamydomonas_01。",
+                            "recipients": ["test-lab@example.invalid"],
+                        },
+                    },
+                    {
+                        "type": "approval",
+                        "pending_id": 900001,
+                        "status": "pending",
+                        "executable": False,
+                        "requires_human_approval": True,
+                    },
+                    {
+                        "type": "scientific_result",
+                        "candidate_count": 2,
+                        "candidates": [
+                            {"candidate_id": "candidate-a"},
+                            {"candidate_id": "candidate-b"},
+                        ],
+                        "validations": [{"candidate_id": "candidate-a"}],
+                        "simulations": [{"candidate_id": "candidate-a"}],
+                        "plan_patches": [{"patch_id": "patch-1"}],
+                        "comparison": {"dimensions": ["benefit", "risk", "cost", "uncertainty"]},
+                    },
+                    {
+                        "type": "paused_task",
+                        "task_id": task["id"],
+                        "reason": "awaiting_recipient",
+                        "completed_work": {"candidate_count": 2},
+                        "remaining_work": ["补充收件人"],
+                        "budget": {},
+                    },
+                ],
+            },
+        },
+    )
+    return {
+        "status": "success",
+        "conversation_id": conversation["id"],
+        "task_id": task["id"],
+    }
 
 
 @router.get("/test-scenarios")

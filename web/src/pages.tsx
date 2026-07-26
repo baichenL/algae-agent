@@ -26,10 +26,10 @@ import DeleteRounded from '@mui/icons-material/DeleteRounded'
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import { api, ApiError } from './api'
 import {
-  ApprovalCard, AsyncActionButton, DebugJson, EmptyState, formatDate, MetricCard, NextActionPanel, PageHeader,
+  AnswerEnvelopeCard, ApprovalCard, AsyncActionButton, DebugJson, DeveloperDetails, EmptyState, formatDate, MarkdownMessage, MetricCard, NextActionPanel, PageHeader,
   ReplanPanel, RunStepper, RunTable, ScientificOverview, StatusChip, TraceGraph,
 } from './components'
-import type { ActionDescriptor, Conversation, ConversationMessage, ConversationTask, RunDetail, UserMemory } from './types'
+import type { ActionDescriptor, AnswerEnvelope, Conversation, ConversationMessage, ConversationTask, RunDetail, UserMemory } from './types'
 
 function Loading() { return <Box sx={{ minHeight: 320, display: 'grid', placeItems: 'center' }}><CircularProgress /></Box> }
 function ErrorPanel({ error }: { error: unknown }) {
@@ -149,11 +149,19 @@ export function AssistantPage() {
           <Box sx={{ minWidth: 0 }}><Stack direction="row" spacing={1} alignItems="center"><Typography variant="h3">当前任务</Typography><StatusChip status={activeTask.status} /></Stack><Typography fontWeight={700} mt={0.5} sx={{ overflowWrap: 'anywhere' }}>{activeTask.goal_text}</Typography><Typography variant="caption" color="text.secondary">{activeTask.missing_slots?.length ? `还需要：${activeTask.missing_slots.join('、')}` : `阶段：${activeTask.task_type}`}</Typography></Box>
           <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>{activeTask.pending_id && <Button component={RouterLink} to="/approvals" size="small">查看审批 #{activeTask.pending_id}</Button>}{activeTask.workflow_run_id && <Button component={RouterLink} to={`/runs/${encodeURIComponent(activeTask.workflow_run_id)}`} size="small">查看运行</Button>}<AsyncActionButton size="small" color="inherit" startIcon={<CancelRounded />} busy={cancelTask.isPending} busyLabel="正在取消" onClick={() => cancelTask.mutate(activeTask.id)}>取消任务</AsyncActionButton></Stack>
         </Stack>
-        {localStorage.getItem('algae-ui-mode') === 'debug' && <Box mt={1}><DebugJson value={activeTask} /></Box>}
+        {localStorage.getItem('algae-ui-mode') === 'debug' && <DeveloperDetails value={activeTask} />}
       </Paper>}
       <Stack spacing={2} sx={{ minHeight: 510, maxHeight: '66vh', overflowY: 'auto', pr: 1 }}>{localMessages.length ? localMessages.map(message => <Box key={message.id || message.client_message_id} alignSelf={message.role === 'user' ? 'flex-end' : 'flex-start'} sx={{ maxWidth: '82%' }}><Paper variant="outlined" sx={{ p: 2, bgcolor: message.role === 'user' ? '#e8f7f3' : '#fff' }}>
         {message.status === 'processing' && <Stack direction="row" spacing={1} alignItems="center" mb={1}><CircularProgress size={16} /><Typography variant="caption" fontWeight={750} color="primary.main">Agent 正在处理，可以离开页面</Typography></Stack>}
-        <Typography whiteSpace="pre-wrap">{message.content}</Typography>
+        <MarkdownMessage>{message.content}</MarkdownMessage>
+        {message.role === 'assistant' && <AnswerEnvelopeCard
+          envelope={(message.structured as any)?.answer_envelope as AnswerEnvelope | undefined}
+          draft={(message.structured as any)?.draft}
+          onResume={() => {
+            const domain = (message.structured as any)?.task_spec?.task_domain
+            setText(domain === 'email' ? '继续邮件任务' : '继续科学任务')
+          }}
+        />}
         {message.status === 'failed' && <Alert severity="error" sx={{ mt: 1 }}>任务处理失败，可在后台任务中查看原因并重试。</Alert>}
         {message.run_id && <Button component={RouterLink} to={`/runs/${encodeURIComponent(message.run_id)}`} size="small" endIcon={<PlayArrowRounded />} sx={{ mt: 1 }}>打开任务详情</Button>}
       </Paper></Box>) : <EmptyState title="开始新对话" description="询问品系状态、知识证据，或创建需要审批的实验任务。" />}</Stack>
@@ -425,6 +433,9 @@ function UserMemoryPanel() {
 
   if (settings.isLoading || active.isLoading || archived.isLoading || candidates.isLoading) return <Box mt={2}><Loading /></Box>
   const error = settings.error || active.error || archived.error || candidates.error || mutation.error
+  if (!settings.data || !active.data || !archived.data || !candidates.data) {
+    return <Box mt={2}>{error ? <ErrorPanel error={error} /> : <Loading />}</Box>
+  }
   const current = settings.data!.settings
   return <Card sx={{ mt: 2 }}><CardContent><Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" gap={2}><Box><Typography variant="h2">我的记忆</Typography><Typography variant="body2" color="text.secondary" mt={0.5}>用户偏好仅用于建议和展示，不会修改实验事实、Policy、审批结果或工具权限。</Typography></Box><Button onClick={exportJson}>导出 JSON</Button></Stack>{error && <Box mt={2}><ErrorPanel error={error} /></Box>}<Stack mt={2}><FormControlLabel control={<Switch checked={current.enabled} onChange={event => changeSettings(event.target.checked, current.auto_write_low_risk)} />} label="启用跨会话 Memory" /><FormControlLabel control={<Switch checked={current.auto_write_low_risk} disabled={!current.enabled} onChange={event => changeSettings(current.enabled, event.target.checked)} />} label="自动保存高置信、低风险偏好" /></Stack><Divider sx={{ my: 2 }} /><Typography variant="h3">待确认候选</Typography>{candidates.data!.candidates.length ? <List>{candidates.data!.candidates.map(candidate => <ListItem key={candidate.id} secondaryAction={<Stack direction="row"><Button onClick={() => mutation.mutate(() => api.decideMemoryCandidate(candidate.id, true))}>确认</Button><Button color="warning" onClick={() => mutation.mutate(() => api.decideMemoryCandidate(candidate.id, false))}>拒绝</Button></Stack>}><ListItemText primary={`${candidate.predicate}: ${renderValue(candidate.value)}`} secondary={`置信度 ${Math.round(candidate.confidence * 100)}% · ${candidate.reason || '待用户确认'} · ${candidate.source_conversation_id || '无来源会话'}`} /></ListItem>)}</List> : <Typography color="text.secondary" py={2}>没有待确认候选。</Typography>}<Divider sx={{ my: 2 }} /><Stack direction={{ xs: 'column', sm: 'row' }} gap={1}><TextField fullWidth label="新增一般备注（仅作建议）" value={note} onChange={event => setNote(event.target.value)} /><Button variant="outlined" disabled={!note.trim()} onClick={() => mutation.mutate(async () => { await api.createMemory('note', 'general.note', note.trim()); setNote('') })}>添加</Button></Stack><Typography variant="h3" mt={3}>当前记忆</Typography>{renderList(active.data!.memories)}<Typography variant="h3" mt={3}>已归档</Typography>{renderList(archived.data!.memories, true)}</CardContent><Dialog open={!!editing} onClose={() => setEditing(null)} fullWidth maxWidth="sm"><DialogTitle>修正记忆</DialogTitle><DialogContent><TextField fullWidth multiline minRows={3} sx={{ mt: 1 }} label={editing?.predicate} value={editValue} onChange={event => setEditValue(event.target.value)} /></DialogContent><DialogActions><Button onClick={() => setEditing(null)}>取消</Button><Button variant="contained" onClick={() => editing && mutation.mutate(async () => { const value = typeof editing.value === 'string' ? editValue : JSON.parse(editValue); await api.updateMemory(editing.id, value, editing.revision); setEditing(null) })}>保存新版本</Button></DialogActions></Dialog></Card>
 }

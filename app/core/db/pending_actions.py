@@ -1,13 +1,40 @@
 import datetime
 import json
+import os
 import sqlite3
 from typing import Any
 
 from app.core.db.connection import DB_PATH
-from app.core.time_utils import display_time_string, local_time_string
+from app.core.time_utils import display_time_string, local_now, local_time_string, parse_time
+from app.core.effects import stable_hash
 
 
-VALID_PENDING_STATUSES = {"pending", "approved", "denied"}
+VALID_PENDING_STATUSES = {"pending", "approved", "denied", "expired", "stale"}
+DEFAULT_PENDING_TTL_SECONDS = max(60, int(os.getenv("PENDING_DEFAULT_TTL_SECONDS", "86400")))
+
+
+def _default_expiry() -> str:
+    return local_time_string(local_now() + datetime.timedelta(seconds=DEFAULT_PENDING_TTL_SECONDS))
+
+
+def _is_expired(expires_at: str | None) -> bool:
+    parsed = parse_time(expires_at)
+    return bool(parsed and parsed <= local_now())
+
+
+def _expire_locked(conn: sqlite3.Connection, action_id: int, expires_at: str | None) -> bool:
+    if not _is_expired(expires_at):
+        return False
+    cursor = conn.execute(
+        """
+        UPDATE pending_actions
+        SET status = 'expired', execution_status = 'expired',
+            execution_error = COALESCE(execution_error, 'pending_expired')
+        WHERE id = ? AND status IN ('pending', 'approved') AND executed_at IS NULL
+        """,
+        (action_id,),
+    )
+    return cursor.rowcount == 1
 
 
 def _with_display_times(row: dict) -> dict:
@@ -27,7 +54,18 @@ def insert_pending_action(
     execution_idempotency_key: str | None = None,
     domain_dedupe_key: str | None = None,
     expires_at: str | None = None,
+    proposal_version: int = 1,
+    proposal_hash: str | None = None,
+    proposal_envelope: dict[str, Any] | None = None,
+    policy_version: str | None = None,
+    expected_resource_versions: dict[str, Any] | None = None,
+    created_by_tool_call_id: str | None = None,
 ) -> int:
+    expires_at = expires_at or _default_expiry()
+    proposal_envelope = dict(proposal_envelope or {})
+    proposal_hash = proposal_hash or (
+        stable_hash(proposal_envelope) if proposal_envelope else None
+    )
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         if execution_idempotency_key:
@@ -68,9 +106,15 @@ def insert_pending_action(
                 graph_thread_id,
                 execution_idempotency_key,
                 domain_dedupe_key,
-                expires_at
+                expires_at,
+                proposal_version,
+                proposal_hash,
+                proposal_envelope_json,
+                policy_version,
+                expected_resource_versions_json,
+                created_by_tool_call_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 action_type,
@@ -85,6 +129,14 @@ def insert_pending_action(
                 execution_idempotency_key,
                 domain_dedupe_key,
                 expires_at,
+                int(proposal_version),
+                proposal_hash,
+                json.dumps(proposal_envelope, ensure_ascii=False, default=str)
+                if proposal_envelope
+                else None,
+                policy_version,
+                json.dumps(expected_resource_versions or {}, ensure_ascii=False, default=str),
+                created_by_tool_call_id,
             )
         )
         conn.commit()
@@ -93,11 +145,16 @@ def insert_pending_action(
 def get_pending_action(action_id: int) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,))
         row = cursor.fetchone()
         if not row:
+            conn.rollback()
             return None
+        if _expire_locked(conn, action_id, row["expires_at"]):
+            row = conn.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,)).fetchone()
+        conn.commit()
         r = dict(row)
         try:
             r["payload"] = json.loads(r.pop("payload_json") or "{}")
@@ -107,11 +164,30 @@ def get_pending_action(action_id: int) -> dict:
             r["execution_result"] = json.loads(r.get("execution_result_json") or "null")
         except Exception:
             r["execution_result"] = None
+        for source, target, fallback in (
+            ("proposal_envelope_json", "proposal_envelope", {}),
+            ("expected_resource_versions_json", "expected_resource_versions", {}),
+        ):
+            try:
+                r[target] = json.loads(r.get(source) or "null") or fallback
+            except Exception:
+                r[target] = fallback
         return _with_display_times(r)
 
 def list_pending_actions(status: str = "pending") -> list:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        expired_rows = conn.execute(
+            """
+            SELECT id, expires_at FROM pending_actions
+            WHERE status IN ('pending', 'approved') AND executed_at IS NULL
+              AND expires_at IS NOT NULL
+            """
+        ).fetchall()
+        for expired_row in expired_rows:
+            _expire_locked(conn, int(expired_row["id"]), expired_row["expires_at"])
+        conn.commit()
         cursor = conn.cursor()
         if status == "all":
             cursor.execute("SELECT * FROM pending_actions ORDER BY id DESC")
@@ -142,25 +218,13 @@ def update_pending_action_status(
 ) -> bool:
     if status not in {"approved", "denied"}:
         return False
-
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE pending_actions
-            SET status = ?, reviewed_at = ?, reviewed_by = ?, review_reason = ?
-            WHERE id = ?
-            """,
-            (
-                status,
-                local_time_string(),
-                reviewed_by,
-                review_reason,
-                action_id,
-            )
-        )
-        conn.commit()
-        return cursor.rowcount > 0
+    result = review_pending_action_with_resume_job(
+        action_id,
+        approve=status == "approved",
+        reviewed_by=reviewed_by,
+        review_reason=review_reason,
+    )
+    return result.get("status") == "success"
 
 
 def review_pending_action_with_resume_job(
@@ -183,6 +247,9 @@ def review_pending_action_with_resume_job(
             conn.rollback()
             return {"status": "error", "reason": "not_found"}
         pending = dict(row)
+        if _expire_locked(conn, action_id, pending.get("expires_at")):
+            conn.commit()
+            return {"status": "error", "reason": "expired", "pending_status": "expired"}
         if pending.get("status") not in {"pending", decision}:
             conn.rollback()
             return {"status": "error", "reason": "already_reviewed", "pending_status": pending.get("status")}
@@ -281,13 +348,27 @@ def claim_resume_job(job_id: int) -> dict[str, Any] | None:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
-            SELECT * FROM approval_resume_jobs
-            WHERE id = ? AND status IN ('pending', 'failed')
+            SELECT j.*, p.expires_at AS pending_expires_at,
+                   p.status AS pending_status
+            FROM approval_resume_jobs j
+            JOIN pending_actions p ON p.id = j.pending_id
+            WHERE j.id = ? AND j.status IN ('pending', 'failed')
             """,
             (job_id,),
         ).fetchone()
         if not row:
             conn.rollback()
+            return None
+        if _expire_locked(conn, int(row["pending_id"]), row["pending_expires_at"]):
+            conn.execute(
+                """
+                UPDATE approval_resume_jobs
+                SET status = 'failed', last_error = 'pending_expired', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, job_id),
+            )
+            conn.commit()
             return None
         conn.execute(
             """
@@ -395,6 +476,15 @@ def mark_pending_resume_failed(action_id: int, error: str) -> None:
 
 def mark_pending_executed(action_id: int, result: dict[str, Any]) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT expires_at FROM pending_actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+        if not row or _expire_locked(conn, action_id, row["expires_at"]):
+            conn.commit()
+            return False
         cursor = conn.execute(
             """
             UPDATE pending_actions
@@ -415,8 +505,31 @@ def mark_pending_executed(action_id: int, result: dict[str, Any]) -> bool:
         return cursor.rowcount == 1
 
 
+def mark_pending_stale(action_id: int, reason: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE pending_actions
+            SET status = 'stale', execution_status = 'stale', execution_error = ?
+            WHERE id = ? AND status = 'approved' AND executed_at IS NULL
+            """,
+            (reason, action_id),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+
+
 def queue_pending_execution(action_id: int) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT expires_at FROM pending_actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+        if not row or _expire_locked(conn, action_id, row["expires_at"]):
+            conn.commit()
+            return False
         cursor = conn.execute(
             """
             UPDATE pending_actions
@@ -432,6 +545,15 @@ def queue_pending_execution(action_id: int) -> bool:
 
 def claim_pending_execution(action_id: int) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT expires_at FROM pending_actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+        if not row or _expire_locked(conn, action_id, row["expires_at"]):
+            conn.commit()
+            return False
         cursor = conn.execute(
             """
             UPDATE pending_actions
@@ -461,6 +583,16 @@ def mark_pending_execution_failed(action_id: int, error: str) -> None:
 def list_recoverable_pending_executions(limit: int = 100) -> list[dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        candidates = conn.execute(
+            """
+            SELECT id, expires_at FROM pending_actions
+            WHERE status = 'approved' AND executed_at IS NULL
+            """
+        ).fetchall()
+        for candidate in candidates:
+            _expire_locked(conn, int(candidate["id"]), candidate["expires_at"])
+        conn.commit()
         rows = conn.execute(
             """
             SELECT * FROM pending_actions
@@ -479,6 +611,39 @@ def list_recoverable_pending_executions(limit: int = 100) -> list[dict[str, Any]
             item["payload"] = {}
         result.append(item)
     return result
+
+
+def set_pending_execution_outcome(
+    action_id: int,
+    *,
+    status: str,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> bool:
+    if status not in {"succeeded", "failed", "partial", "unknown", "expired"}:
+        raise ValueError("invalid_execution_outcome")
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE pending_actions
+            SET execution_status = ?, execution_result_json = COALESCE(?, execution_result_json),
+                execution_error = ?, executed_at = CASE
+                    WHEN ? = 'succeeded' THEN COALESCE(executed_at, ?)
+                    ELSE executed_at
+                END
+            WHERE id = ?
+            """,
+            (
+                status,
+                json.dumps(result, ensure_ascii=False, default=str) if result is not None else None,
+                str(error)[:1000] if error else None,
+                status,
+                local_time_string(),
+                action_id,
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
 
 def delete_pending_action(action_id: int) -> bool:
     with sqlite3.connect(DB_PATH) as conn:

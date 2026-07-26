@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("DEEPSEEK_API_KEY", "test-key")
 os.environ.setdefault("ALGAE_AUTH_MODE", "test")
+os.environ["RAG_SEMANTIC_PARSER"] = "local"
+os.environ["RAG_EMBEDDING_PROVIDER"] = "fake"
 
 
 workflow_stub = types.ModuleType("app.tools.workflow_tool_handlers")
@@ -97,6 +99,7 @@ def isolated_session_memory(monkeypatch):
 def isolated_sqlite_db(tmp_path, monkeypatch):
     from app.core.db import connection, control_plane, experiments, pending_actions, rag, reminder_cycles, schema, scientific, strains, workflow_runs
     from app.core import database
+    from app.core.workspaces import WorkspaceContext, workspace_scope
 
     db_path = tmp_path / "algae_test.sqlite3"
     db_path_str = str(db_path)
@@ -112,14 +115,31 @@ def isolated_sqlite_db(tmp_path, monkeypatch):
     monkeypatch.setattr(scientific, "DB_PATH", db_path_str)
     monkeypatch.setattr(database, "DB_PATH", db_path_str)
 
-    schema.init_db()
-    return db_path
+    # The developer .env may use split control/domain storage.  Unit tests need a
+    # single isolated database regardless of that machine-level setting; otherwise
+    # schema.init_db() initializes the configured workspace paths while assertions
+    # read the temporary path and tests become order/environment dependent.
+    test_workspace = WorkspaceContext(
+        # Runtime fixtures and safety envelopes intentionally use the production
+        # default workspace identity while the physical database remains isolated.
+        # Changing the logical identity here would test cross-workspace denial
+        # instead of the behavior each unit test declares.
+        id="shared",
+        name="pytest",
+        db_path=db_path_str,
+        storage_mode="legacy",
+    )
+    with workspace_scope(test_workspace):
+        schema.init_db()
+        yield db_path
 
 
 @pytest.fixture
 def isolated_chat_side_effects(monkeypatch):
     from app.services.chat import chat_service
 
+    monkeypatch.setenv("RAG_SEMANTIC_PARSER", "local")
+    monkeypatch.setenv("RAG_EMBEDDING_PROVIDER", "fake")
     monkeypatch.setattr(chat_service, "append_decision_event", lambda event: None)
 
     async def fail_llm_path(*args, **kwargs):

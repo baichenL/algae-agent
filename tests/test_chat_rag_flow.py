@@ -29,7 +29,7 @@ def test_chat_routes_tap_question_to_rag(
 
     response = _post_chat(api_client, "TAP 培养基包含哪些组分？", "rag-chat-tap")
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     body = response.json()
     assert body["agent_output"]["action"] == "rag_answer"
     assert body["agent_output"]["answer"]["conclusion"]
@@ -425,7 +425,7 @@ def test_chat_external_ecology_question_never_answers_with_lab_strain_count(
         "rag-chat-external-ecology",
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     body = response.json()
     assert body["agent_output"]["action"] == "model_fallback"
     assert body["agent_output"]["answer_source"] == "model_prior"

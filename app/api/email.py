@@ -5,7 +5,6 @@ from app.core.security import ApiPrincipal, require_approver, require_scientist,
 from app.models.email_schema import EmailDraftRequest, EmailSendRequest, EmailTestRequest
 from app.services.context.context_builder import build_context_snapshot
 from app.services.email.email_log_service import read_recent_email_logs
-from app.services.email.email_service import send_email, test_email_connection
 from app.tools.email_tool import create_email_draft_from_user_message
 
 router = APIRouter()
@@ -29,10 +28,13 @@ async def create_email_draft(payload: EmailDraftRequest, _: ApiPrincipal = Depen
 
 @router.post('/email/send')
 async def send_email_endpoint(payload: EmailSendRequest, _: ApiPrincipal = Depends(require_approver)):
-    result = send_email(payload)
-    if result.sent:
-        return result.model_dump()
-    raise HTTPException(status_code=400, detail=result.model_dump())
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Direct email sending is disabled. Create an immutable email proposal, "
+            "approve its pending id, and let the trusted worker send it."
+        ),
+    )
 
 
 @router.get('/email/logs')
@@ -42,7 +44,7 @@ async def email_logs(limit: int = 50, _: ApiPrincipal = Depends(require_viewer))
 
 @router.post('/email/test')
 async def email_test(payload: EmailTestRequest, _: ApiPrincipal = Depends(require_approver)):
-    result = test_email_connection(payload.recipients)
-    if result.sent:
-        return result.model_dump()
-    raise HTTPException(status_code=400, detail=result.model_dump())
+    raise HTTPException(
+        status_code=409,
+        detail="Direct SMTP tests are disabled in the API process; use the trusted worker diagnostic.",
+    )

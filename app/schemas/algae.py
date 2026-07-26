@@ -14,6 +14,12 @@ class ChatResponse(BaseModel):
     agent_output: Dict[str, Any] = Field(..., description="大模型返回的结构化 JSON 实验方案")
     natural_reply: str = Field(..., description="智能体最终对实验员说的自然语言交互文本")
 
+    agent_status: Optional[str] = None
+    trace_id: Optional[str] = None
+    pending_id: Optional[int] = None
+    state_observation_refs: List[str] = Field(default_factory=list)
+
+
 class SubcultureRequest(BaseModel):
     """请求传代时前端需要提供的最核心元数据"""
     days_since_last_subculture: int = Field(..., description="距离上次传代过去的天数", example=6)

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.config import client
+from app.core.model_registry import model_name
 from app.services.context import (
     ContextBudgetExceeded,
     ModelCallTimer,
@@ -263,7 +264,7 @@ def collect_llm_replan_suggestions(
             messages = envelope.to_messages(state.user_goal or state.user_message)
         timer = ModelCallTimer()
         response = client.chat.completions.create(
-            model=os.getenv("AGENT_REPLAN_LLM_MODEL", "deepseek-chat"),
+            model=model_name("replan"),
             messages=messages,
             temperature=0,
         )

@@ -6,7 +6,7 @@ import sqlite3
 from typing import Any
 
 from app.core.db.connection import DB_PATH
-from app.core.time_utils import local_time_string
+from app.core.time_utils import local_now, local_time_string, parse_time
 
 # 作用是将数据库查询结果行解码为字典，并处理 JSON 字段和布尔字段
 def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -77,7 +77,7 @@ def approve_pending_and_create_run(
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         pending = conn.execute(
-            "SELECT status FROM pending_actions WHERE id = ?",
+            "SELECT status, expires_at, approval_version FROM pending_actions WHERE id = ?",
             (pending_id,),
         ).fetchone()
         if not pending:
@@ -90,6 +90,19 @@ def approve_pending_and_create_run(
         if pending["status"] == "approved" and existing:
             conn.commit()
             return _decode(existing), True
+        expires_at = parse_time(pending["expires_at"])
+        if expires_at and expires_at <= local_now():
+            conn.execute(
+                """
+                UPDATE pending_actions
+                SET status = 'expired', execution_status = 'expired',
+                    execution_error = 'pending_expired'
+                WHERE id = ? AND status IN ('pending', 'approved')
+                """,
+                (pending_id,),
+            )
+            conn.commit()
+            raise ValueError("expired")
         if pending["status"] not in {"pending", "approved"}:
             conn.rollback()
             raise ValueError("already_reviewed")
@@ -97,7 +110,8 @@ def approve_pending_and_create_run(
             conn.execute(
                 """
                 UPDATE pending_actions
-                SET status = 'approved', reviewed_at = ?, reviewed_by = ?
+                SET status = 'approved', reviewed_at = ?, reviewed_by = ?,
+                    approval_version = approval_version + 1
                 WHERE id = ? AND status = 'pending'
                 """,
                 (local_time_string(), reviewed_by, pending_id),

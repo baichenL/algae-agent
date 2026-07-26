@@ -157,7 +157,10 @@ def test_email_chat_route_uses_tool_gateway(monkeypatch, isolated_sqlite_db):
 
     monkeypatch.setattr(chat_service, "execute_registered_tool", fake_tool_executor)
 
-    response = asyncio.run(chat_service.handle_chat(ChatRequest(message="please email lab", session_id="email-gw-s1")))
+    response = asyncio.run(chat_service.handle_chat(ChatRequest(
+        message="please email lab about Chlamydomonas_01",
+        session_id="email-gw-s1",
+    )))
 
     assert response.agent_output["action"] == "email_draft"
     assert captured["tool_name"] == "email_draft"

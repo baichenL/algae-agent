@@ -3,7 +3,9 @@ import os
 import re
 from contextvars import ContextVar
 
+from app.core.config import client
 from app.core.database import list_rag_recipe_components, list_rag_sop_facts
+from app.core.model_registry import model_name
 from app.models.rag_evidence_schema import QueryFrame
 from app.models.rag_semantic_schema import (
     EvidenceContract,
@@ -94,8 +96,6 @@ def _parse_with_structured_llm(question: str) -> SemanticQuery | None:
     if mode == "local" or not api_key or api_key == "test-key":
         return None
     try:
-        from app.core.config import client
-
         schema = SemanticQuery.model_json_schema()
         system_instruction = (
             "Parse the user knowledge question into the supplied JSON schema. "
@@ -123,7 +123,7 @@ def _parse_with_structured_llm(question: str) -> SemanticQuery | None:
             messages = envelope.to_messages(question)
         timer = ModelCallTimer()
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=model_name("router"),
             temperature=0,
             response_format={"type": "json_object"},
             messages=messages,

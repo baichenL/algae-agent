@@ -61,6 +61,13 @@ class EmptyArgs(BaseModel):
 class EmailDraftArgs(BaseModel):
     message: str = Field(..., description="User request or reminder content to turn into an email draft.")
     session_id: str = Field("default_session", description="Session id used to build a read-only context snapshot.")
+    agent_run_id: Optional[str] = Field(None, description="Agent run id for traceability.")
+    source_message: Optional[str] = Field(None, description="Original email request.")
+    created_by_tool_call_id: Optional[str] = Field(None, description="Immutable originating tool call id.")
+    request_approval: bool = Field(
+        False,
+        description="Create an approval-gated send proposal without sending the message.",
+    )
 
 
 TOOL_ARG_MODELS = {

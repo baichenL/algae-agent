@@ -1,12 +1,13 @@
 import sqlite3
 
-from app.core.db.connection import DB_PATH
+from app.core.workspaces import DOMAIN_DATABASE_PATH as DB_PATH
+from app.core.db.domain_connection import connect_domain_readonly, connect_domain_writer
 
 
 def insert_experiment(record: dict) -> int:
     """Insert an experiment record into experiments table. Returns inserted id."""
     import json
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_domain_writer(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -31,7 +32,7 @@ def insert_experiment(record: dict) -> int:
 
 def get_experiment_by_id(experiment_id: int) -> dict:
     import json
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_domain_readonly(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM experiments WHERE id = ?", (experiment_id,))
@@ -56,7 +57,7 @@ def get_experiment_by_id(experiment_id: int) -> dict:
 
 def get_experiments_by_strain(strain: str) -> list:
     import json
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_domain_readonly(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM experiments WHERE strain = ? ORDER BY created_at DESC", (strain,))
@@ -86,7 +87,7 @@ def get_recent_experiments(strain: str = None, limit: int = 5) -> list:
     if safe_limit == 0:
         return []
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_domain_readonly(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         if strain:

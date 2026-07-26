@@ -16,15 +16,31 @@ RUN_ID = {"type": "string", "minLength": 1}
 
 @register_agent_tool(
     name="scientific_datasets_list",
-    schema=_schema([], {}),
+    schema=_schema(
+        [],
+        {
+            "strain_id": {"type": ["string", "null"]},
+            "ready_only": {"type": "boolean"},
+        },
+    ),
     risk_level="none",
     effect_kind="read",
     side_effect="none",
     allowed_callers=["chat_runtime", "scientific_runtime", "mcp_local", "frontend_form"],
+    exposed_to_llm=True,
+    parallel_safe=True,
+    executor_kind="read",
     audit_event_type="scientific_datasets_listed",
 )
-def handle_scientific_datasets_list(_: dict[str, Any]) -> dict[str, Any]:
+def handle_scientific_datasets_list(args: dict[str, Any]) -> dict[str, Any]:
     datasets = scientific_db.list_datasets()
+    if args.get("strain_id"):
+        datasets = [
+            item for item in datasets
+            if item.get("strain_id") == args["strain_id"]
+        ]
+    if args.get("ready_only", True):
+        datasets = [item for item in datasets if item.get("status") == "ready"]
     return {
         "status": "success", "action": "scientific_datasets_list", "datasets": datasets,
         "response_payload": {"status": "success", "action": "scientific_datasets_list", "datasets": datasets},
@@ -37,6 +53,7 @@ def handle_scientific_datasets_list(_: dict[str, Any]) -> dict[str, Any]:
         ["dataset_id"],
         {
             "dataset_id": DATASET_ID,
+            "target_strain_id": {"type": ["string", "null"]},
             "target_metric": {"type": ["string", "null"]},
             "mode": {"type": "string", "enum": ["diagnose", "diagnose_and_optimize"]},
             "offline_replay": {"type": "boolean"},
@@ -45,9 +62,12 @@ def handle_scientific_datasets_list(_: dict[str, Any]) -> dict[str, Any]:
         },
     ),
     risk_level="low",
-    effect_kind="read",
+    effect_kind="compute",
+    effect_class="artifact_write",
     side_effect="scientific_artifacts",
     allowed_callers=["chat_runtime", "scientific_runtime", "mcp_local", "frontend_form"],
+    exposed_to_llm=True,
+    executor_kind="compute",
     audit_event_type="scientific_diagnosis_started",
 )
 def handle_growth_diagnosis_start(args: dict[str, Any]) -> dict[str, Any]:
@@ -57,6 +77,7 @@ def handle_growth_diagnosis_start(args: dict[str, Any]) -> dict[str, Any]:
 
     result = run_scientific_task(
         dataset_id=args["dataset_id"],
+        target_strain_id=args.get("target_strain_id"),
         target_metric=args.get("target_metric"),
         mode=args.get("mode") or "diagnose",
         offline_replay=bool(args.get("offline_replay")),
@@ -75,6 +96,9 @@ def handle_growth_diagnosis_start(args: dict[str, Any]) -> dict[str, Any]:
     effect_kind="read",
     side_effect="none",
     allowed_callers=["chat_runtime", "scientific_runtime", "mcp_local", "frontend_form"],
+    exposed_to_llm=True,
+    parallel_safe=True,
+    executor_kind="read",
     audit_event_type="scientific_design_previewed",
 )
 def handle_experiment_design_preview(args: dict[str, Any]) -> dict[str, Any]:
@@ -94,6 +118,8 @@ def handle_experiment_design_preview(args: dict[str, Any]) -> dict[str, Any]:
     side_effect="db_pending",
     requires_approval=True,
     allowed_callers=["chat_runtime", "scientific_runtime", "mcp_local", "frontend_form"],
+    exposed_to_llm=True,
+    executor_kind="proposal",
     idempotency_fields=["scientific_run_id"],
     audit_event_type="scientific_experiment_proposed",
 )
@@ -110,10 +136,113 @@ def handle_experiment_proposal_request(args: dict[str, Any]) -> dict[str, Any]:
     proposal = create_experiment_proposal(
         args["scientific_run_id"], designs[-1]["payload"],
         requester="tool_gateway", source="scientific_tool", agent_run_id=args.get("agent_run_id"),
+        proposal_version=2,
+        created_by_tool_call_id=args.get("created_by_tool_call_id"),
     )
+    if proposal.get("status") == "proposal_not_ready":
+        payload = {
+            **proposal,
+            "action": "experiment_proposal_request",
+            "message": "The proposal readiness gate rejected this candidate; no pending was created.",
+        }
+        return {**payload, "response_payload": payload}
     payload = {
         **proposal, "action": "scientific_experiment_plan", "require_confirmation": True,
         "message": "A frozen simulation-only experiment plan is waiting for approver review.",
+    }
+    return {**payload, "response_payload": payload}
+
+
+@register_agent_tool(
+    name="candidate_design_simulate",
+    schema=_schema(
+        ["scientific_run_id", "design"],
+        {
+            "scientific_run_id": RUN_ID,
+            "candidate_id": {"type": "string", "minLength": 1},
+            "design": {"type": "object"},
+        },
+    ),
+    description="Validate and simulate one candidate design; returns repairable constraint failures.",
+    risk_level="low",
+    effect_kind="compute",
+    effect_class="artifact_write",
+    side_effect="scientific_artifacts",
+    allowed_callers=["chat_runtime", "scientific_runtime"],
+    exposed_to_llm=True,
+    executor_kind="compute",
+    audit_event_type="candidate_simulated",
+)
+def handle_candidate_design_simulate(args: dict[str, Any]) -> dict[str, Any]:
+    from app.services.scientific.adapters import get_adapter
+    from app.services.scientific.service import _design_from_payload
+    from app.services.scientific.models import experiment_design_hash
+
+    run = scientific_db.get_scientific_run(args["scientific_run_id"])
+    if not run:
+        payload = {
+            "status": "not_found",
+            "action": "candidate_design_simulate",
+            "error_code": "scientific_run_not_found",
+        }
+        return {**payload, "response_payload": payload}
+    dataset = scientific_db.get_dataset(str(run.get("dataset_id") or ""))
+    if not dataset:
+        payload = {
+            "status": "not_found",
+            "action": "candidate_design_simulate",
+            "error_code": "scientific_dataset_not_found",
+        }
+        return {**payload, "response_payload": payload}
+    try:
+        design_payload = dict(args["design"])
+        if design_payload.get("scientific_run_id") != args["scientific_run_id"]:
+            raise ValueError("design_target_mismatch")
+        actual_hash = experiment_design_hash(design_payload)
+        if design_payload.get("design_hash") and design_payload["design_hash"] != actual_hash:
+            raise ValueError("design_hash_mismatch")
+        design_payload["design_hash"] = actual_hash
+        design = _design_from_payload(design_payload)
+    except Exception as exc:
+        payload = {
+            "status": "error",
+            "action": "candidate_design_simulate",
+            "error_code": "invalid_design",
+            "error_details": {"message": str(exc)},
+        }
+        return {**payload, "response_payload": payload}
+    adapter = get_adapter(str(run.get("adapter_id") or "sim-algae-lab-v1"))
+    validation = adapter.validate_design(design)
+    simulation = (
+        adapter.simulate_design(design, dataset=dataset)
+        if validation.get("valid")
+        else {
+            "status": "failed",
+            "validation": validation,
+            "simulation_only": True,
+        }
+    )
+    artifact = scientific_db.add_artifact(
+        args["scientific_run_id"],
+        "candidate_simulation",
+        {
+            "candidate_id": args.get("candidate_id"),
+            "design_hash": design.design_hash,
+            "validation": validation,
+            "simulation": simulation,
+        },
+    )
+    payload = {
+        "status": "success" if simulation.get("status") == "success" else "simulation_failed",
+        "action": "candidate_design_simulate",
+        "candidate_id": args.get("candidate_id"),
+        "design_hash": design.design_hash,
+        "validation": validation,
+        "simulation": simulation,
+        "artifact_ref": artifact["content_hash"],
+        "repairable_fields": [
+            item.get("code") for item in validation.get("issues") or []
+        ],
     }
     return {**payload, "response_payload": payload}
 

@@ -3,6 +3,7 @@
 from app.models.rag_schema import RagQueryRequest
 from app.schemas.algae import ChatResponse
 from app.core.config import client
+from app.core.model_registry import model_name
 from app.services.agent_runtime import record_run_event
 from app.services.chat.operational_claim_guard import guard_chat_reply
 from app.services.chat.response_builder import _complete_chat_response
@@ -200,7 +201,7 @@ def _build_model_fallback_reply(
     try:
         timer = ModelCallTimer()
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=model_name("rag_answer"),
             messages=messages,
             temperature=0.2,
         )

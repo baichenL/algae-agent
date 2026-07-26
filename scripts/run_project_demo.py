@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,7 @@ from app.schemas.algae import ChatRequest, ChatResponse
 from app.services.chat import chat_service
 from app.services.intent import dispatcher
 from app.services.observability.agent_trace import build_agent_run_trace
+from app.core.workspaces import WorkspaceContext, workspace_scope
 from scripts.run_agent_eval import configure_temp_db, load_cases, run_eval, seed_case
 
 
@@ -53,7 +55,7 @@ def _fake_rag(session_id, conversation_history, message, agent_run_id=None):
 
 async def _run_demo_chats() -> list[dict[str, Any]]:
     run_ids = iter(DEMO_RUN_IDS)
-    original_uuid4 = chat_service.uuid.uuid4
+    original_uuid_module = chat_service.uuid
     original_llm = chat_service._handle_llm_or_tool_path
     original_rag = dispatcher.handle_rag_intent
 
@@ -61,9 +63,12 @@ async def _run_demo_chats() -> list[dict[str, Any]]:
         try:
             return next(run_ids)
         except StopIteration:
-            return original_uuid4()
+            return original_uuid_module.uuid4()
 
-    chat_service.uuid.uuid4 = next_demo_uuid
+    # Replace only chat_service's module reference. Mutating uuid.uuid4 on the
+    # shared stdlib module also changes conversation-task IDs and consumes the
+    # deterministic run-ID iterator in an implementation-dependent order.
+    chat_service.uuid = SimpleNamespace(uuid4=next_demo_uuid)
     chat_service._handle_llm_or_tool_path = _fake_llm
     dispatcher.handle_rag_intent = _fake_rag
     try:
@@ -93,7 +98,7 @@ async def _run_demo_chats() -> list[dict[str, Any]]:
             )
         return steps
     finally:
-        chat_service.uuid.uuid4 = original_uuid4
+        chat_service.uuid = original_uuid_module
         chat_service._handle_llm_or_tool_path = original_llm
         dispatcher.handle_rag_intent = original_rag
 
@@ -119,11 +124,19 @@ def _seed_demo_data() -> None:
 
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="algae_agent_project_demo_", ignore_cleanup_errors=True) as tmpdir:
-        configure_temp_db(Path(tmpdir) / "project_demo.sqlite3")
-        _seed_demo_data()
-        steps = asyncio.run(_run_demo_chats())
-        workflow_trace = build_agent_run_trace("project-demo-workflow") or {}
-        eval_report = run_eval(load_cases(), mode="runtime")
+        demo_db_path = Path(tmpdir) / "project_demo.sqlite3"
+        demo_workspace = WorkspaceContext(
+            id="shared",
+            name="project-demo",
+            db_path=str(demo_db_path),
+            storage_mode="legacy",
+        )
+        with workspace_scope(demo_workspace):
+            configure_temp_db(demo_db_path)
+            _seed_demo_data()
+            steps = asyncio.run(_run_demo_chats())
+            workflow_trace = build_agent_run_trace("project-demo-workflow") or {}
+            eval_report = run_eval(load_cases(), mode="runtime")
 
     output = {
         "status": "success" if _demo_succeeded(steps, eval_report, workflow_trace) else "failed",

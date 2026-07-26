@@ -178,10 +178,10 @@ def test_agent_trace_api_keeps_envelope_for_early_failure(monkeypatch, isolated_
     assert result.status_code == 200
     trace = result.json()["trace"]
     assert trace["final_status"] == "failed"
-    assert trace["failure_stage"] == "handle_chat"
+    assert trace["failure_stage"] == "build_task_spec"
     assert trace["failure_layer"] == "chat_service"
     assert trace["error_event_id"]
-    assert trace["errors"][0]["operation"] == "handle_chat"
+    assert trace["errors"][0]["operation"] == "build_task_spec"
     assert [item["event_type"] for item in trace["lifecycle_events"]] == ["run_started", "run_failed"]
 
 

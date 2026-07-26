@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '@mui/material'
 import { describe, expect, it, vi } from 'vitest'
 import { AppShell } from './App'
-import { ApprovalCard, EmptyState, NextActionPanel, OperationFeedback, ReplanPanel, RunStepper } from './components'
+import { AnswerEnvelopeCard, ApprovalCard, EmptyState, NextActionPanel, OperationFeedback, ReplanPanel, RunStepper } from './components'
 import { theme } from './theme'
 import type { Approval, RunDetail } from './types'
 
@@ -29,6 +29,32 @@ const run: RunDetail = {
 function wrapper(children: React.ReactNode) {
   return <ThemeProvider theme={theme}><MemoryRouter>{children}</MemoryRouter></ThemeProvider>
 }
+
+it('renders AnswerEnvelope source failures and run links', () => {
+  render(wrapper(<AnswerEnvelopeCard envelope={{
+    schema_version: 'answer-envelope/v1',
+    outcome_status: 'partial',
+    direct_answer: 'partial result',
+    confirmed_facts: [],
+    inferences: [],
+    simulation_results: [],
+    recommendations: [],
+    unknowns: ['SOP evidence unavailable'],
+    source_statuses: [{ source: 'rag', status: 'failed', impact: 'embedding unavailable' }],
+    completed_work: {},
+    remaining_work: [],
+    budget: {},
+    references: [
+      { type: 'agent_trace', id: 'trace-1' },
+      { type: 'scientific_run', id: 'sci-1' },
+    ],
+    next_actions: [],
+  }} />))
+
+  expect(screen.getByText(/rag: failed/)).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: 'Agent Trace' })).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: 'Scientific Run' })).toBeInTheDocument()
+})
 
 describe('统一流程组件', () => {
   it('显示服务端阶段和当前审批边界', () => {

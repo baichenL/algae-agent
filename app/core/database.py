@@ -22,6 +22,7 @@ from app.core.db.pending_actions import (
     list_pending_resume_jobs,
     list_pending_actions,
     mark_pending_executed,
+    mark_pending_stale,
     mark_pending_execution_failed,
     mark_pending_resume_completed,
     mark_pending_resume_failed,
@@ -32,6 +33,14 @@ from app.core.db.pending_actions import (
     claim_pending_execution,
     list_recoverable_pending_executions,
     update_pending_action_status,
+    set_pending_execution_outcome,
+)
+from app.core.db.outcomes import (
+    create_effect_receipt,
+    get_effect_receipt,
+    get_effect_receipt_by_execution_key,
+    get_state_observation,
+    reduce_effect_receipt,
 )
 from app.core.db.reflection_rules import insert_reflection_rule
 from app.core.db.rag import (
@@ -105,6 +114,7 @@ from app.core.db.reminder_cycles import (
 from app.core.db.schema import init_db
 from app.core.db.strains import (
     add_algae_strain,
+    apply_strain_mutation_once,
     delete_algae_strain,
     get_algae_status,
     list_algae_status,
@@ -125,6 +135,7 @@ __all__ = [
     "get_algae_status",
     "list_algae_status",
     "update_algae_status",
+    "apply_strain_mutation_once",
     "insert_experiment",
     "get_experiment_by_id",
     "get_experiments_by_strain",
@@ -196,6 +207,7 @@ __all__ = [
     "mark_pending_resume_completed",
     "mark_pending_resume_failed",
     "mark_pending_executed",
+    "mark_pending_stale",
     "mark_pending_execution_failed",
     "queue_pending_execution",
     "claim_pending_execution",
@@ -203,6 +215,12 @@ __all__ = [
     "get_pending_action",
     "list_pending_actions",
     "update_pending_action_status",
+    "set_pending_execution_outcome",
+    "create_effect_receipt",
+    "get_effect_receipt",
+    "get_effect_receipt_by_execution_key",
+    "get_state_observation",
+    "reduce_effect_receipt",
     "get_last_db_operation",
     "delete_pending_action",
     "delete_algae_strain",

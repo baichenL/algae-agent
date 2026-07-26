@@ -3,13 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.schemas.algae import ChatRequest
+from app.schemas.algae import ChatRequest, ChatResponse
 from app.services.agent_runtime.decision import decision_from_routing_decision
 from app.services.agent_runtime.executor import build_agent_action
 from app.services.agent_runtime.policy import evaluate_policy
 from app.services.agent_runtime.state import AgentRunState
 from app.services.chat import chat_service, pending_form_state as pfs
-from app.services.intent import intent_router
+from app.services.intent import dispatcher, intent_router
 from app.services.intent.input_normalizer import normalize_input
 from app.services.intent.intent_handlers import handle_query_status_intent
 from app.services.intent.llm_candidate_provider import LlmRouteCandidate
@@ -428,3 +428,56 @@ def test_original_message_is_preserved_in_pending_form(tmp_path, monkeypatch, is
     asyncio.run(chat_service.handle_chat(ChatRequest(message=original, session_id="original-s1")))
 
     assert pfs.get_pending_form_state("original-s1")["source_message"] == original
+
+
+def test_cancel_active_update_then_answer_current_knowledge_question(
+    tmp_path,
+    monkeypatch,
+    isolated_sqlite_db,
+):
+    """STATE-002: cancellation and the new read request are one ordered plan."""
+
+    session_id = "state-002-cancel-and-read"
+    monkeypatch.setattr(pfs, "STATE_DIR", str(tmp_path))
+    pfs.save_pending_form_state(
+        session_id,
+        {
+            "active": True,
+            "operation": "update",
+            "tool_name": "update_algae_strain",
+            "collected_fields": {"strain_id": "Chlamydomonas_01"},
+            "missing_fields": ["fields_to_update"],
+            "candidates": [],
+            "source_message": "更新 Chlamydomonas_01。",
+        },
+    )
+    monkeypatch.setattr(
+        chat_service,
+        "get_session_memory",
+        lambda _session_id: [{"role": "system", "content": "test"}],
+    )
+    monkeypatch.setattr(chat_service, "build_context_snapshot", lambda _session_id: _context())
+    monkeypatch.setattr(chat_service, "append_decision_event", lambda event: None)
+
+    def fake_rag(session_id, conversation_history, message, agent_run_id=None):
+        return ChatResponse(
+            status="success",
+            session_id=session_id,
+            agent_output={"action": "rag_answer", "status": "success"},
+            natural_reply="TAP 是莱茵衣藻常用的 Tris-乙酸-磷酸盐培养基。",
+        )
+
+    monkeypatch.setattr(dispatcher, "handle_rag_intent", fake_rag)
+
+    response = asyncio.run(
+        chat_service.handle_chat(
+            ChatRequest(
+                message="顺便告诉我 TAP 培养基是什么，不要继续刚才的更新。",
+                session_id=session_id,
+            )
+        )
+    )
+
+    assert pfs.get_pending_form_state(session_id) is None
+    assert "TAP" in response.natural_reply
+    assert "Tris" in response.natural_reply

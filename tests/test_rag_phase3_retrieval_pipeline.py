@@ -102,6 +102,7 @@ def test_bge_unavailable_degrades_to_business_calibration(monkeypatch):
 def test_hybrid_bundle_exposes_sparse_dense_semantic_and_rrf(isolated_sqlite_db, tmp_path, monkeypatch):
     monkeypatch.setenv("RAG_EMBEDDING_ENABLED", "true")
     monkeypatch.setenv("RAG_EMBEDDING_PROVIDER", "fake")
+    monkeypatch.setenv("RAG_SEMANTIC_FALLBACK_ENABLED", "true")
     source = tmp_path / "manual__retrieval_demo__v1__en.txt"
     source.write_text("Photobioreactor setup protocol with sterile tubing.", encoding="utf-8")
     ingest_file(source)

@@ -6,6 +6,7 @@ from typing import Any
 from app.core.db import assistant_conversations, conversation_tasks
 from app.core.workspaces import current_workspace
 from app.services.agent_runtime.state import RuntimeRequestContext
+from app.services.chat.task_spec import TaskSpec
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,7 @@ class ResolvedConversationTask:
     request_context: RuntimeRequestContext
     reused_active: bool
     persisted: bool = True
+    task_spec: TaskSpec | None = None
 
 
 def default_request_context(conversation_id: str) -> RuntimeRequestContext:
@@ -33,6 +35,7 @@ def resolve_conversation_task(
     message: str,
     agent_run_id: str,
     request_context: RuntimeRequestContext | None = None,
+    task_spec: TaskSpec | None = None,
 ) -> ResolvedConversationTask:
     context = request_context or default_request_context(conversation_id)
     if not assistant_conversations.get_conversation(conversation_id):
@@ -41,34 +44,73 @@ def resolve_conversation_task(
             request_context=context,
             reused_active=False,
             persisted=False,
+            task_spec=task_spec,
         )
     active = conversation_tasks.get_active_task(
         conversation_id,
         owner=context.owner,
         workspace_id=context.workspace_id,
     )
-    if active:
+    relation = task_spec.task_relation if task_spec else "continue_current"
+    domain = task_spec.task_domain if task_spec else "conversation_turn"
+    if active and relation == "continue_current":
         task = conversation_tasks.update_task(
             active["id"],
             latest_agent_run_id=agent_run_id,
+            task_spec=task_spec.to_dict() if task_spec else active.get("task_spec"),
             event_type="task_turn_received",
         )
         return ResolvedConversationTask(
             task=task,
             request_context=replace(context, task_id=task["id"]),
             reused_active=True,
+            task_spec=task_spec,
         )
+    if active and relation == "cancel_previous_and_start":
+        conversation_tasks.cancel_task(active["id"], reason="superseded_by_explicit_user_request")
+        active = None
+    elif active and relation == "start_new":
+        conversation_tasks.suspend_task(active["id"])
+        active = None
+    elif relation == "resume_named_task":
+        named = conversation_tasks.find_latest_task(
+            conversation_id,
+            task_type=domain,
+            owner=context.owner,
+            workspace_id=context.workspace_id,
+        )
+        if named:
+            if active and active["id"] != named["id"]:
+                conversation_tasks.suspend_task(active["id"], superseded_by_task_id=named["id"])
+            task = conversation_tasks.update_task(
+                named["id"],
+                status="running",
+                state_changing=domain in {"email", "strain_mutation", "subculture"},
+                latest_agent_run_id=agent_run_id,
+                task_spec=task_spec.to_dict() if task_spec else named.get("task_spec"),
+                event_type="task_resumed",
+            )
+            return ResolvedConversationTask(
+                task=task,
+                request_context=replace(context, task_id=task["id"]),
+                reused_active=True,
+                task_spec=task_spec,
+            )
     task = conversation_tasks.create_task(
         conversation_id=conversation_id,
         owner=context.owner,
         workspace_id=context.workspace_id,
         goal_text=message,
+        task_type=domain,
         latest_agent_run_id=agent_run_id,
+        task_spec=task_spec.to_dict() if task_spec else None,
+        parent_task_id=active["id"] if active and relation == "side_question" else None,
     )
     return ResolvedConversationTask(
         task=task,
         request_context=replace(context, task_id=task["id"]),
         reused_active=False,
+        task_spec=task_spec,
     )
 
 
@@ -96,20 +138,40 @@ def synchronize_task_from_response(
         return conversation_tasks.cancel_task(task["id"])
 
     if status == "needs_more_info" or action in {"workflow_request_clarification", "require_more_info"}:
-        task_type = "subculture" if action.startswith("workflow") else f"strain_{output.get('operation') or 'mutation'}"
+        is_email = (
+            (resolved.task_spec and resolved.task_spec.task_domain == "email")
+            or action == "email_draft"
+        )
+        task_type = (
+            "email"
+            if is_email
+            else "subculture"
+            if action.startswith("workflow")
+            else f"strain_{output.get('operation') or 'mutation'}"
+        )
         return conversation_tasks.update_task(
             task["id"],
             task_type=task_type,
             status="collecting",
             state_changing=True,
             missing_slots=missing,
-            proposed_action=_pending_action(output),
+            proposed_action={
+                **_pending_action(output),
+                **(
+                    {"email_request_spec": output.get("email_request_spec")}
+                    if output.get("email_request_spec")
+                    else {}
+                ),
+            },
             event_type="task_waiting_input",
         )
 
     pending_id = output.get("pending_id")
     if pending_id and status == "pending":
-        task_type = "subculture" if action == "workflow_subculture" else f"strain_{output.get('operation') or 'mutation'}"
+        if action == "email_draft":
+            task_type = "email"
+        else:
+            task_type = "subculture" if action == "workflow_subculture" else f"strain_{output.get('operation') or 'mutation'}"
         return conversation_tasks.update_task(
             task["id"],
             task_type=task_type,
@@ -117,8 +179,45 @@ def synchronize_task_from_response(
             state_changing=True,
             missing_slots=[],
             pending_id=int(pending_id),
-            proposed_action=_pending_action(output),
+            proposed_action={
+                **_pending_action(output),
+                **({"draft": output.get("draft")} if output.get("draft") else {}),
+            },
             event_type="task_pending_created",
+        )
+
+    if action == "email_draft" and status == "success":
+        return conversation_tasks.update_task(
+            task["id"],
+            task_type="email",
+            status="ready",
+            state_changing=True,
+            missing_slots=[],
+            proposed_action={
+                **_pending_action(output),
+                "draft": output.get("draft"),
+                "requires_approval": True,
+            },
+            event_type="task_email_draft_ready",
+        )
+
+    outcome_status = str(
+        output.get("outcome_status")
+        or (output.get("answer_envelope") or {}).get("outcome_status")
+        or ""
+    )
+    if status == "paused" or outcome_status == "paused" or (
+        status == "partial" and output.get("budget_exhausted")
+    ):
+        return conversation_tasks.pause_task(
+            task["id"],
+            reason=str(output.get("pause_reason") or output.get("budget_exhausted") or "budget_exhausted"),
+            proposed_action={
+                **(task.get("proposed_action") or {}),
+                "checkpoint_id": output.get("checkpoint_id"),
+                "remaining_work": output.get("remaining_work") or [],
+                "budget": output.get("budget") or {},
+            },
         )
 
     if resolved.reused_active and task.get("state_changing"):
@@ -129,7 +228,7 @@ def synchronize_task_from_response(
         )
         return conversation_tasks.get_task(task["id"]) or task
 
-    final_status = "failed" if status == "error" else "completed"
+    final_status = "failed" if status in {"error", "failed"} or outcome_status == "failed" else "completed"
     return conversation_tasks.update_task(
         task["id"],
         status=final_status,

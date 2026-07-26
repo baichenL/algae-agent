@@ -36,29 +36,6 @@ LSTM/
 .env.*
 !.env.example
 
-# Private project material (never publish)
-
-docs/
-private/
-internal/
-secrets/
-credentials/
-
-# Keys, certificates, and provider credentials
-
-*.pem
-*.key
-*.p12
-*.pfx
-*.jks
-*.keystore
-id_rsa*
-id_ed25519*
-*credentials*.json
-*service-account*.json
-.aws/
-.gcp/
-
 # =========================================================
 
 # Local databases / runtime data
@@ -191,3 +168,5 @@ temp/
 
 project_tree.txt
 tree.txt
+
+/artifacts/

@@ -14,6 +14,16 @@ services:
       RAG_BGE_LOCAL_FILES_ONLY: "true"
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+      TRUSTED_WORKER_INLINE: "false"
+      WORKSPACE_STORAGE_MODE: "split"
+      ALGAE_CONTROL_DB_PATH: /app/data/control/algae_control.db
+      ALGAE_DOMAIN_DB_PATH: /app/data/domain/algae_domain.db
+      EMAIL_HOST: ""
+      EMAIL_USER: ""
+      EMAIL_PASSWORD: ""
+      SMTP_HOST: ""
+      SMTP_USERNAME: ""
+      SMTP_PASSWORD: ""
     ports:
       - "${ALGAE_BIND_HOST:-127.0.0.1}:${ALGAE_AGENT_PORT:-8000}:8000"
     init: true
@@ -36,6 +46,49 @@ services:
       - type: volume
         source: algae-data
         target: /app/data
+      - type: volume
+        source: algae-control-data
+        target: /app/data/control
+      - type: volume
+        source: algae-domain-data
+        target: /app/data/domain
+        read_only: true
+
+  algae-trusted-worker:
+    image: "algae-agent:${ALGAE_IMAGE_TAG:-local}"
+    pull_policy: never
+    depends_on:
+      algae-agent:
+        condition: service_started
+    env_file: .env
+    environment:
+      TRUSTED_WORKER_PROCESS: "true"
+      WORKSPACE_STORAGE_MODE: "split"
+      ALGAE_CONTROL_DB_PATH: /app/data/control/algae_control.db
+      ALGAE_DOMAIN_DB_PATH: /app/data/domain/algae_domain.db
+      DEEPSEEK_API_KEY: ""
+      OPENAI_API_KEY: ""
+      RAG_BGE_RERANKER_MODEL: /opt/models/bge-reranker-v2-m3
+      RAG_BGE_LOCAL_FILES_ONLY: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    command: ["python", "-m", "app.workers.trusted_execution"]
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - type: volume
+        source: algae-data
+        target: /app/data
+      - type: volume
+        source: algae-control-data
+        target: /app/data/control
+      - type: volume
+        source: algae-domain-data
+        target: /app/data/domain
 
   algae-frontend:
     image: "algae-agent:${ALGAE_IMAGE_TAG:-local}"
@@ -59,3 +112,5 @@ services:
 
 volumes:
   algae-data:
+  algae-control-data:
+  algae-domain-data:

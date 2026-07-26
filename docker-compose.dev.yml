@@ -19,6 +19,19 @@ services:
         source: ./data
         target: /app/data
 
+  algae-trusted-worker:
+    user: "${ALGAE_DEV_UID:-0}:${ALGAE_DEV_GID:-0}"
+    cap_add:
+      - DAC_OVERRIDE
+      - FOWNER
+    volumes:
+      - type: bind
+        source: ./app
+        target: /app/app
+      - type: bind
+        source: ./data
+        target: /app/data
+
   algae-frontend:
     volumes:
       - type: bind

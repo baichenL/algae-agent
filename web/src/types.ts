@@ -37,9 +37,31 @@ export interface ConversationMessage {
   structured?: unknown; client_message_id?: string; created_at?: string
   status?: 'processing' | 'completed' | 'failed'; operation_id?: string; task_id?: string
 }
+export interface AnswerEnvelope {
+  schema_version: 'answer-envelope/v1' | 'answer-envelope/v2'
+  outcome_status: 'success' | 'partial' | 'needs_input' | 'pending' | 'paused' | 'failed'
+  direct_answer: string
+  confirmed_facts: unknown[]
+  inferences: unknown[]
+  simulation_results: unknown[]
+  recommendations: unknown[]
+  unknowns: string[]
+  source_statuses: Array<{ source: string; status: string; used?: boolean; impact?: string }>
+  completed_work: Record<string, unknown>
+  remaining_work: unknown[]
+  budget: Record<string, unknown>
+  references: Array<{ type: string; id: string | number }>
+  next_actions: Array<{ action: string; label: string; task_id?: string; pending_id?: number }>
+  presentation_blocks?: PresentationBlock[]
+}
+export type PresentationBlock =
+  | { type: 'email_draft'; draft: Record<string, any>; target?: string; send: false }
+  | { type: 'approval'; pending_id: number; status: string; executable: false; requires_human_approval: true }
+  | { type: 'scientific_result'; candidate_count: number; candidates: unknown[]; validations: unknown[]; simulations: unknown[]; plan_patches: unknown[]; comparison: Record<string, unknown>; scientific_run_id?: string }
+  | { type: 'paused_task'; task_id?: string; reason?: string; completed_work: Record<string, unknown>; remaining_work: unknown[]; budget: Record<string, unknown> }
 export interface ConversationTask {
   id: string; conversation_id: string; task_type: string; goal_text: string
-  status: 'collecting' | 'ready' | 'waiting_approval' | 'running' | 'waiting_manual_confirmation' | 'completed' | 'cancelled' | 'failed' | 'expired'
+  status: 'collecting' | 'ready' | 'waiting_approval' | 'running' | 'waiting_manual_confirmation' | 'suspended' | 'paused' | 'completed' | 'cancelled' | 'failed' | 'expired'
   collected_slots: Record<string, unknown>; missing_slots: string[]
   proposed_action?: Record<string, any>; pending_id?: number; workflow_run_id?: string
   latest_agent_run_id?: string; version: number; updated_at?: string

@@ -7,13 +7,81 @@ from app.core.db.connection import DB_PATH
 from app.core.time_utils import local_time_string
 from app.core.db.scientific import init_scientific_schema
 from app.core.db.control_plane import init_control_plane_schema
+from app.core.workspaces import current_workspace, storage_target_scope
 
 
-def init_db():
+def init_db(*, include_domain: bool | None = None):
+    workspace = current_workspace()
+    if workspace.storage_mode != "split":
+        _init_current_db()
+        _ensure_domain_execution_table()
+        return
+    trusted = os.getenv("TRUSTED_WORKER_PROCESS", "false").casefold() in {
+        "1", "true", "yes", "on",
+    }
+    initialize_domain = trusted if include_domain is None else bool(include_domain)
+    with storage_target_scope("control"):
+        _init_current_db(workspace.control_path())
+        _remove_domain_tables_from_control(workspace.control_path())
+    if initialize_domain:
+        with storage_target_scope("domain"):
+            _init_current_db(workspace.domain_path())
+            _ensure_domain_execution_table(workspace.domain_path())
+            _retain_domain_tables_only(workspace.domain_path())
+
+
+DOMAIN_FACT_TABLES = {
+    "algae_status",
+    "experiments",
+    "algae_audit",
+    "domain_executions",
+}
+
+
+def _ensure_domain_execution_table(db_path=None) -> None:
+    with sqlite3.connect(db_path or DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS domain_executions (
+                execution_idempotency_key TEXT PRIMARY KEY,
+                action_type TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _remove_domain_tables_from_control(db_path=None) -> None:
+    with sqlite3.connect(db_path or DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        for table in sorted(DOMAIN_FACT_TABLES):
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        conn.commit()
+
+
+def _retain_domain_tables_only(db_path=None) -> None:
+    with sqlite3.connect(db_path or DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        rows = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            """
+        ).fetchall()
+        for (table,) in rows:
+            if table not in DOMAIN_FACT_TABLES:
+                conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        conn.commit()
+
+
+def _init_current_db(db_path=None):
     """初始化数据库，严格记录实验室物理存在的藻株及其详尽的中英文元数据"""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    resolved_db_path = os.fspath(db_path or DB_PATH)
+    os.makedirs(os.path.dirname(resolved_db_path), exist_ok=True)
     
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(resolved_db_path) as conn:
         cursor = conn.cursor()
         # 注意：不再在初始化时删除已有的 `algae_status` 表，以免重启覆盖生产数据。
         # 仅在表不存在时创建（保留历史数据与手动写入记录）。
@@ -383,9 +451,13 @@ def init_db():
                 collected_slots_json TEXT,
                 missing_slots_json TEXT,
                 proposed_action_json TEXT,
+                task_spec_json TEXT,
                 pending_id INTEGER,
                 workflow_run_id TEXT,
                 latest_agent_run_id TEXT,
+                parent_task_id TEXT,
+                superseded_by_task_id TEXT,
+                pause_reason TEXT,
                 version INTEGER NOT NULL DEFAULT 1,
                 legacy_source TEXT UNIQUE,
                 created_at TEXT NOT NULL,
@@ -394,6 +466,7 @@ def init_db():
                 completed_at TEXT
             )
         """)
+        _ensure_conversation_task_columns(cursor)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_conversation_tasks_conversation
             ON conversation_tasks (conversation_id, updated_at)
@@ -617,6 +690,68 @@ def init_db():
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_approval_resume_jobs_thread
             ON approval_resume_jobs (graph_thread_id)
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS effect_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                execution_idempotency_key TEXT NOT NULL UNIQUE,
+                tool_call_id TEXT,
+                agent_run_id TEXT,
+                workspace_id TEXT NOT NULL,
+                pending_id INTEGER,
+                approval_version INTEGER,
+                proposal_hash TEXT,
+                effect_class TEXT NOT NULL,
+                executor_identity TEXT NOT NULL,
+                status TEXT NOT NULL,
+                state_changes_json TEXT NOT NULL DEFAULT '[]',
+                business_fact_changed INTEGER NOT NULL DEFAULT 0,
+                external_effect_performed INTEGER NOT NULL DEFAULT 0,
+                provider_reference TEXT,
+                resource_versions_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                payload_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                reduced_at TEXT,
+                reduction_status TEXT,
+                reduction_error TEXT,
+                FOREIGN KEY(pending_id) REFERENCES pending_actions(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_effect_receipts_pending
+            ON effect_receipts (pending_id, created_at)
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS state_observations (
+                state_observation_id TEXT PRIMARY KEY,
+                receipt_id TEXT NOT NULL UNIQUE,
+                pending_id INTEGER,
+                canonical_status TEXT NOT NULL,
+                pending_status TEXT,
+                workflow_status TEXT,
+                business_state_version TEXT,
+                external_effect_status TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(receipt_id) REFERENCES effect_receipts(receipt_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_artifacts_v2 (
+                artifact_id TEXT PRIMARY KEY,
+                agent_run_id TEXT,
+                artifact_type TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_agent_artifacts_v2_run_type
+            ON agent_artifacts_v2 (agent_run_id, artifact_type, version)
         """)
 
         conn.commit()
@@ -1215,6 +1350,12 @@ def _ensure_pending_action_columns(cursor):
         "execution_status": "TEXT DEFAULT 'not_started'",
         "execution_started_at": "TEXT",
         "execution_error": "TEXT",
+        "proposal_version": "INTEGER DEFAULT 1",
+        "proposal_hash": "TEXT",
+        "proposal_envelope_json": "TEXT",
+        "policy_version": "TEXT",
+        "expected_resource_versions_json": "TEXT",
+        "created_by_tool_call_id": "TEXT",
     }
     for column_name, column_def in required_columns.items():
         if column_name not in existing_columns:
@@ -1312,6 +1453,22 @@ def _ensure_background_operation_columns(cursor):
     existing_columns = {row[1] for row in cursor.fetchall()}
     if "related_task_id" not in existing_columns:
         cursor.execute("ALTER TABLE background_operations ADD COLUMN related_task_id TEXT")
+
+
+def _ensure_conversation_task_columns(cursor):
+    cursor.execute("PRAGMA table_info(conversation_tasks)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    required_columns = {
+        "task_spec_json": "TEXT",
+        "parent_task_id": "TEXT",
+        "superseded_by_task_id": "TEXT",
+        "pause_reason": "TEXT",
+    }
+    for column_name, column_def in required_columns.items():
+        if column_name not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE conversation_tasks ADD COLUMN {column_name} {column_def}"
+            )
 
 
 def _ensure_rag_evidence_unit_columns(cursor):

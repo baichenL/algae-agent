@@ -1,4 +1,5 @@
 from app.core.config import client
+from app.core.model_registry import model_name
 from app.schemas.algae import ChatResponse
 from app.services.chat.operational_claim_guard import guard_chat_reply
 from app.services.context import (
@@ -127,7 +128,7 @@ async def handle_llm_or_tool_path(
     timer = ModelCallTimer()
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=model_name("chat"),
             messages=messages,
             temperature=0.1,
         )

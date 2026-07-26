@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 from app.core.config import client
+from app.core.model_registry import model_name
 from app.services.user_memory.catalog import PREDICATES, contains_prohibited_sensitive_data, validate_memory_input
 
 
@@ -62,7 +63,7 @@ def auto_write_threshold() -> float:
 def extract_candidates(user_text: str, assistant_text: str) -> tuple[str, list[dict[str, Any]]]:
     if contains_prohibited_sensitive_data(user_text):
         return "deterministic_sensitive_filter", []
-    model = os.getenv("USER_MEMORY_EXTRACTION_MODEL", os.getenv("HYBRID_ROUTER_LLM_MODEL", "deepseek-chat"))
+    model = model_name("memory")
     request = {
         "model": model,
         "messages": [

@@ -16,10 +16,11 @@ def test_readiness_probe_accepts_disabled_reranker(monkeypatch, isolated_sqlite_
     response = TestClient(main.app).get("/health/ready")
 
     assert response.status_code == 200
-    assert response.json()["checks"] == {
-        "database": {"status": "ready"},
-        "reranker": {"status": "disabled"},
-    }
+    checks = response.json()["checks"]
+    assert checks["database"] == {"status": "ready"}
+    assert checks["reranker"] == {"status": "disabled"}
+    assert checks["models"]["status"] == "ready"
+    assert checks["embedding"]["status"] in {"ready", "disabled", "degraded", "enabled_fake"}
 
 
 def test_readiness_probe_rejects_degraded_reranker(monkeypatch, isolated_sqlite_db):

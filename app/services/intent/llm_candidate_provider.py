@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.core.config import client
+from app.core.model_registry import model_name
 from app.services.context import (
     ContextBudgetExceeded,
     ModelCallTimer,
@@ -165,7 +166,7 @@ def _remote_intent_frame(
             messages = envelope.to_messages(original_text)
         timer = ModelCallTimer()
         response = client.chat.completions.create(
-            model=os.getenv("HYBRID_ROUTER_LLM_MODEL", "deepseek-chat"),
+            model=model_name("router"),
             messages=messages,
             temperature=0,
         )

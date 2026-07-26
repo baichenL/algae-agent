@@ -3,13 +3,16 @@ import math
 import os
 import re
 import time
+import threading
 from dataclasses import dataclass
 
 from openai import OpenAI
 
 
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"
 DEFAULT_FAKE_DIMENSION = 64
+_probe_lock = threading.Lock()
+_probe_status: dict | None = None
 
 FAKE_SYNONYMS = {
     "pbr": ["photobioreactor", "reactor"],
@@ -43,7 +46,7 @@ def get_embedding_config() -> EmbeddingConfig:
         base_url=os.getenv("RAG_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
         api_key=os.getenv("RAG_EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY"),
         vector_backend=os.getenv("RAG_VECTOR_BACKEND", "sqlite_vec"),
-        batch_size=max(int(os.getenv("RAG_EMBEDDING_BATCH_SIZE", "32")), 1),
+        batch_size=max(int(os.getenv("RAG_EMBEDDING_BATCH_SIZE", "10")), 1),
         dimension=int(os.getenv("RAG_FAKE_EMBEDDING_DIMENSION", str(DEFAULT_FAKE_DIMENSION))),
     )
 
@@ -61,7 +64,7 @@ def embedding_runtime_status() -> dict:
         status = "enabled"
     backend = "sqlite_vec" if config.vector_backend == "sqlite_vec" and sqlite_vec_available else "sqlite_blob_fallback"
     degraded = bool(config.vector_backend == "sqlite_vec" and backend != "sqlite_vec")
-    return {
+    runtime = {
         "status": status,
         "provider": config.provider,
         "model": config.model,
@@ -71,6 +74,52 @@ def embedding_runtime_status() -> dict:
         "degraded": degraded,
         "degraded_reason": "sqlite_vec_unavailable_blob_cosine_fallback" if degraded else None,
     }
+    if _probe_status:
+        runtime.update(_probe_status)
+        runtime["degraded"] = bool(runtime.get("degraded") or _probe_status.get("status") != "ready")
+    return runtime
+
+
+def probe_embedding_capability(*, force: bool = False) -> dict:
+    global _probe_status
+    config = get_embedding_config()
+    if not config.enabled:
+        return {"status": "disabled", "degraded": False}
+    if config.provider == "fake":
+        return {"status": "ready", "degraded": False, "probe": "fake"}
+    enabled = _env_bool("RAG_EMBEDDING_PROBE_ENABLED", default=True)
+    if not enabled:
+        return {"status": "configured", "degraded": False, "probe": "disabled"}
+    with _probe_lock:
+        if _probe_status and not force:
+            return dict(_probe_status)
+        try:
+            vectors = _embed_openai_compatible(["health"], config)
+            if not vectors or not vectors[0]:
+                raise RuntimeError("embedding_probe_returned_empty_vector")
+            _probe_status = {"status": "ready", "degraded": False, "probe": "completed"}
+        except Exception as exc:
+            lowered = str(exc).casefold()
+            code = (
+                "embedding_model_configuration_error"
+                if "model_not_found" in lowered or "does not exist" in lowered or "invalid_request_error" in lowered
+                else "embedding_service_unavailable"
+            )
+            _probe_status = {
+                "status": "degraded",
+                "degraded": True,
+                "probe": "completed",
+                "degraded_reason": code,
+                "provider": config.provider,
+                "model": config.model,
+            }
+        return dict(_probe_status)
+
+
+def reset_embedding_probe_status() -> None:
+    global _probe_status
+    with _probe_lock:
+        _probe_status = None
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:

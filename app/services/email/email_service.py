@@ -10,6 +10,7 @@ from typing import List, Optional
 
 from app.models.email_schema import EmailLogRecord, EmailSendRequest, EmailSendResponse
 from app.services.email.email_log_service import append_email_log
+from app.services.email.recipient_policy import get_default_recipients
 from app.services.observability.error_events import record_error_event
 from app.core.workspaces import current_workspace
 
@@ -44,11 +45,6 @@ def build_email_settings_from_env() -> Optional[EmailSettings]:
         allowed_recipients=[item.strip() for item in allowed.split(",") if item.strip()],
         timeout_seconds=_int_env("EMAIL_TIMEOUT_SECONDS", _int_env("SMTP_TIMEOUT_SECONDS", 15)),
     )
-
-
-def get_default_recipients() -> List[str]:
-    settings = build_email_settings_from_env()
-    return settings.allowed_recipients if settings else []
 
 
 def validate_recipients(recipients: List[str], settings: EmailSettings) -> None:
@@ -102,6 +98,8 @@ def send_email(request: EmailSendRequest) -> EmailSendResponse:
         message["Subject"] = request.subject
         message["From"] = settings.email_from
         message["To"] = ", ".join(request.recipients)
+        if request.metadata.get("message_id"):
+            message["Message-ID"] = str(request.metadata["message_id"])
         message.set_content(request.body)
 
         with smtplib.SMTP(settings.host, settings.port, timeout=settings.timeout_seconds) as server:

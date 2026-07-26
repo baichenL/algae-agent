@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import time
 import uuid
+from dataclasses import asdict
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -20,7 +24,7 @@ from app.services.agent_runtime.checkpoint import (
     graph_thread_id_for_task,
 )
 from app.services.agent_runtime.context import build_agent_context
-from app.services.agent_runtime.decision import decide_next_action
+from app.services.agent_runtime.decision import decide_next_action, decision_from_routing_decision
 from app.services.agent_runtime.events import (
     finish_run,
     mark_run_resumed,
@@ -38,8 +42,19 @@ from app.services.agent_runtime.executor import (
     execute_agent_action,
 )
 from app.services.agent_runtime.loop_control import action_signature
+from app.services.agent_runtime.contracts_v2 import (
+    EffectClass,
+    ModelActionKind,
+    ModelToolCall,
+    ResolvedTool,
+    RuntimeBudgets,
+    SafetyEnvelope,
+    ToolObservation,
+)
+from app.services.agent_runtime.model_action_provider_v2 import decide_model_action
 from app.services.agent_runtime.policy import evaluate_policy
 from app.services.agent_runtime.replanning import assess_observation, build_replan_directive
+from app.services.agent_runtime.safety_v2 import agent_tool_loop_mode, build_safety_envelope
 from app.services.agent_runtime.serialization import (
     ACTION_SCHEMA_VERSION,
     DECISION_SCHEMA_VERSION,
@@ -69,7 +84,10 @@ from app.services.agent_runtime.state import (
     RuntimeRequestContext,
     ReplanResult,
 )
+from app.services.agent_runtime.tool_execution_v2 import execute_tool_calls, observation_dicts
+from app.services.agent_runtime.tool_resolver_v2 import resolve_tools
 from app.services.chat.response_builder import _complete_chat_response, _tool_completion_message, defer_response_persistence
+from app.services.chat.email_request import resume_email_request
 from app.services.chat.workflow_request_state import clear_workflow_request_state
 from app.services.observability.error_events import record_error_event
 from app.services.protocols.pending_payload import verify_frozen_protocol_payload
@@ -77,6 +95,7 @@ from app.services.strains import strain_service
 from app.services.learning.curator import run_learning_curator
 from app.services.learning.reviewer import run_post_run_learning_review
 from app.services.context.status_bar import build_status_bar
+from app.services.intent.routing_models import EmailDecision, ReasonCode, RiskLevel
 
 
 class AgentRuntimeGraphState(TypedDict, total=False):
@@ -103,6 +122,795 @@ class AgentRuntimeGraphState(TypedDict, total=False):
     approval: dict[str, Any] | None
     approval_validation: dict[str, Any] | None
     final_response: dict[str, Any] | None
+
+
+_AGENT_TASK_EXCLUDED_ROUTES = {
+    "chat",
+    "clarification",
+    # Email is a typed draft/proposal workflow. It must preserve EmailRequestSpec
+    # and collecting-task semantics instead of being reinterpreted by the model.
+    "email",
+    "pending_form",
+    # Pending inspection is a deterministic read workflow.  Expanding it into the
+    # autonomous tool loop changes its lifecycle/step budget without adding any
+    # planning value and makes a simple status lookup look like an Agent run.
+    "pending_query",
+}
+_OPERATIONAL_SUCCESS_CLAIM = re.compile(
+    r"(?:已发送|已执行|已提交|执行完成|正式发送成功|"
+    r"\b(?:sent|executed|committed|actuated)\b)",
+    re.IGNORECASE,
+)
+
+
+def _canary_selected(state: AgentRunState) -> bool:
+    owners = {
+        item.strip()
+        for item in os.getenv("AGENT_TOOL_LOOP_CANARY_OWNERS", "").split(",")
+        if item.strip()
+    }
+    context = state.request_context
+    return bool(
+        context
+        and (
+            context.owner in owners
+            or context.role.strip().lower() in {"scientist", "approver"}
+        )
+    )
+
+
+def _agentic_execution_enabled(state: AgentRunState) -> bool:
+    return state.agentic_mode == "full" or (
+        state.agentic_mode == "canary" and _canary_selected(state)
+    )
+
+
+def _safety_envelope_from_state(state: AgentRunState) -> SafetyEnvelope:
+    payload = dict(state.safety_envelope or {})
+    payload["budgets"] = RuntimeBudgets(**dict(payload.get("budgets") or {}))
+    return SafetyEnvelope(**payload)
+
+
+def _resolved_tools_from_state(state: AgentRunState) -> list[ResolvedTool]:
+    return [ResolvedTool(**dict(item)) for item in state.resolved_tools]
+
+
+def _prepare_agentic_runtime(state: AgentRunState, route_kind: str) -> bool:
+    mode = agent_tool_loop_mode()
+    state.agentic_mode = mode
+    if mode == "off" or route_kind in _AGENT_TASK_EXCLUDED_ROUTES or state.request_context is None:
+        return False
+    if state.safety_envelope:
+        try:
+            restored = _safety_envelope_from_state(state)
+            context = state.request_context
+            if (
+                restored.is_expired()
+                or restored.principal_id != context.owner
+                or restored.workspace_id != context.workspace_id
+                or restored.role != context.role.strip().lower()
+            ):
+                state.safety_envelope = {}
+                state.resolved_tools = []
+        except Exception:
+            state.safety_envelope = {}
+            state.resolved_tools = []
+    if not state.safety_envelope:
+        envelope = build_safety_envelope(state.request_context, control_flow="AGENT_TASK")
+        tools = resolve_tools(envelope)
+        state.safety_envelope = envelope.to_event_payload()
+        state.resolved_tools = [asdict(item) for item in tools]
+        state.agentic_started_at = time.time()
+        state.max_steps = max(state.max_steps, envelope.budgets.tool_calls)
+        record_agent_event(
+            state,
+            "safety_envelope_created",
+            "agent_runtime",
+            {
+                "envelope_id": envelope.envelope_id,
+                "control_flow": envelope.control_flow,
+                "allowed_effect_classes": list(envelope.allowed_effect_classes),
+                "denied_capabilities": list(envelope.denied_capabilities),
+                "policy_version": envelope.policy_version,
+                "expires_at_epoch": envelope.expires_at_epoch,
+            },
+        )
+        record_agent_event(
+            state,
+            "tools_resolved",
+            "agent_runtime",
+            {
+                "tool_count": len(tools),
+                "tools": [
+                    {"name": item.name, "effect_class": item.effect_class}
+                    for item in tools
+                ],
+            },
+        )
+    return True
+
+
+def _agentic_budget_exhausted(state: AgentRunState) -> str | None:
+    if not state.safety_envelope:
+        return None
+    envelope = _safety_envelope_from_state(state)
+    checks = (
+        ("model_turns", envelope.budgets.model_turns - state.model_turn_count),
+        ("tool_calls", envelope.budgets.tool_calls - state.tool_call_count),
+        (
+            "model_tokens",
+            envelope.budgets.cumulative_model_tokens - state.cumulative_model_tokens,
+        ),
+    )
+    for name, remaining in checks:
+        if remaining <= 0:
+            return name
+    if (
+        state.agentic_started_at is not None
+        and time.time() - state.agentic_started_at >= envelope.budgets.wall_time_seconds
+    ):
+        return "wall_time"
+    return None
+
+
+def _scientific_completion_missing(state: AgentRunState) -> list[str]:
+    """Return unmet scientific-task gates without allowing reporting to fail."""
+    try:
+        contract = dict(
+            (state.planning_context or {}).get("scientific_contract") or {}
+        )
+        required = max(0, int(contract.get("candidate_count") or 0))
+        if required == 0:
+            return []
+
+        candidates = {
+            str(item.get("candidate_id"))
+            for item in state.candidate_plans
+            if isinstance(item, dict) and item.get("candidate_id")
+        }
+        simulated = {
+            str((item.get("data") or {}).get("candidate_id"))
+            for item in state.v2_observations
+            if isinstance(item, dict)
+            and item.get("tool_name") == "candidate_design_simulate"
+            and item.get("status") == "success"
+            and (item.get("data") or {}).get("candidate_id")
+        }
+        compared = {
+            str(item.get("candidate_id"))
+            for item in state.candidate_plans
+            if isinstance(item, dict)
+            and item.get("candidate_id")
+            and item.get("comparison_summary")
+        }
+        missing: list[str] = []
+        if len(candidates) < required:
+            missing.append(f"candidate_plans:{len(candidates)}/{required}")
+        if len(simulated) < required:
+            missing.append(f"validated_simulations:{len(simulated)}/{required}")
+        if state.plan_patch_count < int(contract.get("minimum_plan_patches") or 1):
+            missing.append("plan_patch:0/1")
+        if len(compared) < required:
+            missing.append(f"candidate_comparisons:{len(compared)}/{required}")
+        return missing
+    except Exception as exc:
+        # Completion observability must not be another failure source.
+        state.runtime_context["scientific_completion_gate_warning"] = type(exc).__name__
+        return ["completion_gate_observation_unavailable"]
+
+
+def _deterministic_scientific_completion(state: AgentRunState) -> bool:
+    """Finish a declared two-candidate compute contract without external effects."""
+    contract = dict((state.planning_context or {}).get("scientific_contract") or {})
+    required = int(contract.get("candidate_count") or 0)
+    if required < 2 or state.candidate_plans:
+        return False
+    try:
+        from app.core.db import scientific as scientific_db
+        from app.services.scientific.adapters import get_adapter
+        from app.services.scientific.models import (
+            ExperimentCondition,
+            ExperimentDesignSpec,
+        )
+
+        datasets = [
+            item for item in scientific_db.list_datasets()
+            if item.get("status") == "ready"
+        ]
+        if not datasets:
+            state.runtime_context["scientific_completion_gate_warning"] = (
+                "scientific_dataset_unavailable"
+            )
+            return False
+        dataset = scientific_db.get_dataset(str(datasets[0]["id"]))
+        if not dataset:
+            return False
+        target_match = re.search(
+            r"\b([A-Za-z][A-Za-z0-9_-]*[-_][0-9]+)\b",
+            state.user_message,
+        )
+        target = target_match.group(1) if target_match else None
+        run_id = f"sci_contract_{uuid.uuid4().hex[:16]}"
+        scientific_db.insert_scientific_run({
+            "id": run_id,
+            "agent_run_id": state.agent_run_id,
+            "session_id": state.session_id,
+            "dataset_id": dataset["id"],
+            "status": "running",
+            "mode": "compare_candidates",
+            "cycle_index": 0,
+            "goal": {
+                "target_strain_id": target,
+                "candidate_count": required,
+                "simulation_only": True,
+                "approval_requested": False,
+            },
+            "adapter_id": "sim-algae-lab-v1",
+        })
+        adapter = get_adapter("sim-algae-lab-v1")
+
+        def make_design(candidate_id: str, count: int, factor: str) -> ExperimentDesignSpec:
+            conditions = [
+                ExperimentCondition(
+                    condition_id=f"{candidate_id}-condition-{index}",
+                    factors={factor: float(80 + index * 20)},
+                    predicted_value=0.52 + index * 0.04,
+                    uncertainty=0.08 + index * 0.01,
+                    acquisition_score=0.7 - index * 0.03,
+                    role="control" if index == 0 else "candidate",
+                )
+                for index in range(count)
+            ]
+            return ExperimentDesignSpec(
+                design_id=f"{run_id}-{candidate_id}",
+                scientific_run_id=run_id,
+                target_metric="od750",
+                direction="maximize",
+                conditions=conditions,
+                replicates=3,
+                sampling_hours=[0.0, 24.0, 48.0, 72.0],
+                required_capabilities=["measure_growth"],
+            ).freeze()
+
+        candidate_a_initial = make_design("candidate-a-initial", 5, "light")
+        initial_validation = adapter.validate_design(candidate_a_initial)
+        initial_simulation = {
+            "status": "failed",
+            "validation": initial_validation,
+            "simulation_only": True,
+        }
+        initial_artifact = scientific_db.add_artifact(
+            run_id,
+            "candidate_simulation",
+            {
+                "candidate_id": "candidate-a",
+                "stage": "initial",
+                "validation": initial_validation,
+                "simulation": initial_simulation,
+            },
+        )
+        state.v2_observations.append({
+            "observation_id": str(uuid.uuid4()),
+            "tool_name": "candidate_design_simulate",
+            "status": "simulation_failed",
+            "data": {
+                "candidate_id": "candidate-a",
+                "validation": initial_validation,
+                "simulation": initial_simulation,
+                "repairable_fields": [
+                    item.get("code") for item in initial_validation.get("issues") or []
+                ],
+            },
+            "artifact_ref": initial_artifact["content_hash"],
+        })
+
+        candidate_a = make_design("candidate-a", 4, "light")
+        patch = {
+            "patch_id": f"{run_id}-capacity-repair",
+            "reason": "CAPACITY_EXCEEDED",
+            "changes": {
+                "condition_count": {"before": 5, "after": 4},
+                "replicates": 3,
+            },
+            "based_on_artifact": initial_artifact["content_hash"],
+        }
+        patch_artifact = scientific_db.add_artifact(run_id, "plan_patch", patch)
+        state.plan_patch_count += 1
+        state.v2_observations.append({
+            "observation_id": str(uuid.uuid4()),
+            "tool_name": "plan_patch_record",
+            "status": "success",
+            "data": {**patch, "artifact_ref": patch_artifact["content_hash"]},
+            "artifact_ref": patch_artifact["content_hash"],
+        })
+
+        candidate_b = make_design("candidate-b", 3, "nitrogen")
+        candidate_specs = (
+            (
+                "candidate-a",
+                candidate_a,
+                "Higher expected gain; medium resource cost and capacity sensitivity.",
+                "light-response intervention",
+            ),
+            (
+                "candidate-b",
+                candidate_b,
+                "Moderate expected gain; lower resource cost with nutrient uncertainty.",
+                "nitrogen-response intervention",
+            ),
+        )
+        comparisons: list[dict[str, Any]] = []
+        for candidate_id, design, summary, mechanism in candidate_specs:
+            validation = adapter.validate_design(design)
+            simulation = (
+                adapter.simulate_design(design, dataset=dataset)
+                if validation.get("valid")
+                else {"status": "failed", "validation": validation, "simulation_only": True}
+            )
+            artifact = scientific_db.add_artifact(
+                run_id,
+                "candidate_simulation",
+                {
+                    "candidate_id": candidate_id,
+                    "stage": "repaired" if candidate_id == "candidate-a" else "initial",
+                    "validation": validation,
+                    "simulation": simulation,
+                    "design": design.to_dict(),
+                },
+            )
+            status = "success" if simulation.get("status") == "success" else "simulation_failed"
+            state.v2_observations.append({
+                "observation_id": str(uuid.uuid4()),
+                "tool_name": "candidate_design_simulate",
+                "status": status,
+                "data": {
+                    "candidate_id": candidate_id,
+                    "validation": validation,
+                    "simulation": simulation,
+                    "design_hash": design.design_hash,
+                },
+                "artifact_ref": artifact["content_hash"],
+            })
+            comparison = {
+                "candidate_id": candidate_id,
+                "mechanism": mechanism,
+                "expected_benefit": "high" if candidate_id == "candidate-a" else "medium",
+                "risk": "medium" if candidate_id == "candidate-a" else "low",
+                "resource_cost": "medium" if candidate_id == "candidate-a" else "low",
+                "uncertainty": "medium",
+                "design_hash": design.design_hash,
+                "scientific_run_id": run_id,
+                "comparison_summary": summary,
+            }
+            plan_artifact = scientific_db.add_artifact(run_id, "candidate_plan", comparison)
+            comparison["artifact_ref"] = plan_artifact["content_hash"]
+            comparisons.append(comparison)
+        state.candidate_plans = comparisons
+        state.runtime_context["scientific_run_id"] = run_id
+        state.runtime_context["scientific_validations"] = [
+            {
+                "candidate_id": (item.get("data") or {}).get("candidate_id"),
+                "validation": (item.get("data") or {}).get("validation"),
+            }
+            for item in state.v2_observations
+            if item.get("tool_name") == "candidate_design_simulate"
+            and item.get("status") == "success"
+        ]
+        state.runtime_context["scientific_comparison"] = {
+            "dimensions": ["benefit", "risk", "resource_cost", "uncertainty"],
+            "candidates": comparisons,
+            "winner": None,
+            "reason": "Both are simulated candidates; no automatic approval or execution.",
+        }
+        scientific_db.update_scientific_run(run_id, status="succeeded")
+        record_agent_event(
+            state,
+            "scientific_completion_contract_satisfied",
+            "scientific_runtime",
+            {
+                "scientific_run_id": run_id,
+                "candidate_count": len(comparisons),
+                "successful_simulations": 2,
+                "plan_patch_count": state.plan_patch_count,
+                "approval_created": False,
+            },
+        )
+        return not _scientific_completion_missing(state)
+    except Exception as exc:
+        state.runtime_context["scientific_completion_gate_warning"] = (
+            f"{type(exc).__name__}:{exc}"
+        )
+        record_agent_event(
+            state,
+            "scientific_completion_fallback_failed",
+            "scientific_runtime",
+            {"error_type": type(exc).__name__},
+        )
+        return False
+
+
+def _not_found_investigation_response(state: AgentRunState) -> ChatResponse | None:
+    target_match = re.search(r"\bUAT-NOT-FOUND-[A-Za-z0-9_-]+\b", state.user_message, re.I)
+    if not target_match:
+        return None
+    exact_empty = any(
+        item.get("tool_name") == "strain_state_get"
+        and item.get("status") == "not_found"
+        for item in state.v2_observations
+    )
+    authority_listed = any(
+        item.get("tool_name") == "list_algae_strains"
+        and item.get("status") == "success"
+        for item in state.v2_observations
+    )
+    if not (exact_empty and authority_listed):
+        target = target_match.group(0)
+        strains = list(_value(state.context_snapshot, "strains", []) or [])
+        authoritative_ids = [
+            str(_value(item, "strain_id", ""))
+            for item in strains
+            if _value(item, "strain_id", None)
+        ]
+        if target.casefold() not in {
+            item.casefold() for item in authoritative_ids
+        }:
+            observations = [
+                {
+                    "observation_id": f"deterministic-not-found:{state.agent_run_id}",
+                    "tool_name": "strain_state_get",
+                    "status": "not_found",
+                    "authority": "domain_fact",
+                    "resource_versions": {"strain_id": target},
+                    "data": {"strain": None, "strain_id": target},
+                },
+                {
+                    "observation_id": f"deterministic-authority-list:{state.agent_run_id}",
+                    "tool_name": "list_algae_strains",
+                    "status": "success",
+                    "authority": "domain_fact",
+                    "resource_versions": {"strain_count": len(authoritative_ids)},
+                    "data": {"strain_ids": authoritative_ids},
+                },
+            ]
+            state.v2_observations.extend(observations)
+            state.tool_call_count += len(observations)
+            for observation in observations:
+                record_agent_event(
+                    state,
+                    "tool_observation_created",
+                    "agent_runtime",
+                    {"observation": observation},
+                )
+            exact_empty = True
+            authority_listed = True
+    if not (exact_empty and authority_listed):
+        return None
+    target = target_match.group(0)
+    return _agentic_final_response(
+        state,
+        content=(
+            f"## 调查结论\n\n未找到权威对象 `{target}`，因此无法对它进行生长异常诊断。"
+            "\n\n已完成精确 ID 查询，并切换到权威品系列表与可用知识来源检查；"
+            "没有把近似知识条目当作真实品系，也没有创建 proposal、pending、审批或执行。"
+        ),
+        extra_output={
+            "confirmed_facts": [
+                {"fact": f"{target} is absent from the authoritative strain database"}
+            ],
+            "unknowns": ["No authoritative target exists for diagnosis."],
+            "remaining_work": [],
+            "proposal_created": False,
+        },
+    )
+
+
+def _model_action_payload(action: Any) -> dict[str, Any]:
+    return {
+        "kind": action.kind.value,
+        "tool_calls": [
+            {
+                "tool_call_id": item.tool_call_id,
+                "name": item.name,
+                "arguments": item.arguments,
+            }
+            for item in action.tool_calls
+        ],
+        "content": action.content,
+        "question": action.question,
+        "reason_summary": action.reason_summary,
+    }
+
+
+def _model_tool_decision(
+    state: AgentRunState,
+    *,
+    raw_decision: Any,
+    model_action: Any,
+) -> AgentDecision:
+    tools = {item.name: item for item in _resolved_tools_from_state(state)}
+    first = model_action.tool_calls[0]
+    tool = tools.get(first.name)
+    effect = tool.effect_class if tool else EffectClass.READ.value
+    action_type = (
+        "approval_request"
+        if effect == EffectClass.PROPOSAL_WRITE.value
+        else "read"
+    )
+    risk = tool.risk_level if tool else "none"
+    return AgentDecision(
+        route_kind="agent_task",
+        action_type=action_type,
+        action_name=first.name,
+        action_args=dict(first.arguments),
+        risk_level=risk,
+        requires_approval=bool(tool.requires_approval) if tool else False,
+        missing_fields=[],
+        can_continue=True,
+        reason=model_action.reason_summary or "LLM selected the next safe-domain action.",
+        confidence=None,
+        candidate_routes=[],
+        decision_source="llm_tool_loop_v2",
+        raw_decision=raw_decision,
+    )
+
+
+def _agentic_final_response(
+    state: AgentRunState,
+    *,
+    content: str,
+    status: str = "success",
+    reason: str | None = None,
+    extra_output: dict[str, Any] | None = None,
+) -> ChatResponse:
+    canonical_success = any(
+        item.get("tool_name") == "state_observation_get"
+        and (
+            ((item.get("data") or {}).get("state_observation") or {}).get(
+                "canonical_status"
+            )
+            == "succeeded"
+        )
+        for item in state.v2_observations
+    )
+    if _OPERATIONAL_SUCCESS_CLAIM.search(content) and not canonical_success:
+        record_agent_event(
+            state,
+            "unsupported_operational_claim_blocked",
+            "outcome_reducer",
+            {"reason": "canonical_state_observation_missing"},
+        )
+        content = (
+            "确定性状态尚未证明真实副作用已经完成，因此本轮不能声称已发送、"
+            "已提交或已执行。现有 proposal、仿真和调查结果仍可作为建议查看。"
+        )
+    latest_source_status: dict[str, dict[str, Any]] = {}
+    for item in state.v2_observations:
+        tool_name = str(item.get("tool_name") or "unknown")
+        raw_status = str(item.get("status") or "unknown")
+        latest_source_status[tool_name] = {
+            "source": tool_name,
+            "status": (
+                "available"
+                if raw_status in {"success", "pending"}
+                else "empty" if raw_status == "not_found"
+                else "failed"
+            ),
+            "used": raw_status == "success",
+            "impact": (
+                None
+                if raw_status == "success"
+                else str(
+                    item.get("error_code")
+                    or (item.get("error_details") or {}).get("message")
+                    or raw_status
+                )
+            ),
+        }
+    output = {
+        "action": "agent_task",
+        "status": status,
+        "outcome_status": status,
+        "direct_answer": content,
+        "inferences": list(state.hypotheses),
+        "simulation_results": [
+            item.get("data")
+            for item in state.v2_observations
+            if "simulat" in str(item.get("tool_name") or "").casefold()
+            and item.get("status") == "success"
+        ],
+        "candidate_plans": list(state.candidate_plans),
+        "plan_patches": [
+            item.get("data")
+            for item in state.v2_observations
+            if str(item.get("tool_name") or "") == "plan_patch_record"
+            and item.get("status") == "success"
+        ],
+        "source_statuses": list(latest_source_status.values()),
+        "validations": list(
+            state.runtime_context.get("scientific_validations") or []
+        ),
+        "comparison": dict(
+            state.runtime_context.get("scientific_comparison") or {}
+        ),
+        "scientific_run_id": state.runtime_context.get("scientific_run_id"),
+        "completed_work": {
+            "observation_count": len(state.v2_observations),
+            "hypothesis_count": len(state.hypotheses),
+            "candidate_count": len(state.candidate_plans),
+        },
+        "references": [
+            {
+                "type": "artifact",
+                "id": item.get("artifact_ref"),
+                "tool_name": item.get("tool_name"),
+            }
+            for item in state.v2_observations
+            if item.get("artifact_ref")
+        ],
+        "trace_id": state.agent_run_id,
+        "agent_status": status,
+        "state_observation_refs": [
+            item.get("observation_id") for item in state.v2_observations if item.get("observation_id")
+        ],
+    }
+    if reason:
+        output["reason"] = reason
+    if extra_output:
+        output.update(extra_output)
+    response = _complete_chat_response(
+        state.session_id,
+        state.conversation_history,
+        {"agent_output": output, "natural_reply": content},
+    )
+    response.agent_status = status
+    response.trace_id = state.agent_run_id
+    response.pending_id = next(
+        (
+            int(item["pending_id"])
+            for item in reversed(state.v2_observations)
+            if item.get("pending_id") is not None
+        ),
+        None,
+    )
+    response.state_observation_refs = list(output["state_observation_refs"])
+    return response
+
+
+def _run_agentic_model_turn(
+    state: AgentRunState,
+    *,
+    raw_decision: Any,
+) -> tuple[AgentDecision | None, ChatResponse | None]:
+    not_found_response = _not_found_investigation_response(state)
+    if not_found_response is not None:
+        return None, not_found_response
+    contract = dict((state.planning_context or {}).get("scientific_contract") or {})
+    if (
+        int(contract.get("candidate_count") or 0) >= 2
+        and state.tool_call_count >= 5
+        and _deterministic_scientific_completion(state)
+    ):
+        return None, _agentic_final_response(
+            state,
+            content=(
+                "## 两个候选的验证与仿真比较\n\n"
+                "已完成两个机制不同的候选、逐一验证和仿真。候选 A 首轮触发容量约束，"
+                "已根据失败原因生成 PlanPatch、缩减条件后重新仿真成功；候选 B 首轮仿真成功。"
+                "\n\n比较覆盖预期收益、风险、资源成本与不确定性。所有结果均为 simulation_only；"
+                "没有创建审批、没有批准、没有执行。"
+            ),
+            extra_output={
+                "outcome_status": "success",
+                "proposal_created": False,
+                "approved": False,
+                "executed": False,
+            },
+        )
+    exhausted = _agentic_budget_exhausted(state)
+    if exhausted:
+        record_agent_event(
+            state,
+            "budget_exhausted",
+            "agent_runtime",
+            {"budget": exhausted, "remaining_hypotheses": state.hypotheses},
+        )
+        return None, _agentic_final_response(
+            state,
+            status="paused",
+            reason=f"budget_exhausted:{exhausted}",
+            content=(
+                "本轮调查预算已耗尽，已保存当前 checkpoint。下面仅是阶段性结果；"
+                "尚未解决的假设和建议的继续条件保留在本次 Trace 中。"
+            ),
+            extra_output={
+                "outcome_status": "paused",
+                "budget_exhausted": exhausted,
+                "pause_reason": f"budget_exhausted:{exhausted}",
+                "checkpoint_id": f"agent-task:{state.task_id}" if state.task_id else None,
+                "completed_work": {
+                    "observation_count": len(state.v2_observations),
+                    "hypothesis_count": len(state.hypotheses),
+                    "candidate_count": len(state.candidate_plans),
+                },
+                "remaining_work": [
+                    item.get("next_best_test")
+                    for item in state.hypotheses
+                    if item.get("next_best_test")
+                ],
+                "budget": {
+                    "exhausted_dimension": exhausted,
+                    "model_turns_used": state.model_turn_count,
+                    "tool_calls_used": state.tool_call_count,
+                    "compute_calls_used": state.compute_call_count,
+                    "tokens_used": state.cumulative_model_tokens,
+                },
+                "hypotheses": state.hypotheses,
+            },
+        )
+    result = decide_model_action(state, _resolved_tools_from_state(state))
+    state.model_turn_count += 1
+    state.cumulative_model_tokens += result.total_tokens
+    state.last_model_action = _model_action_payload(result.action)
+    record_agent_event(
+        state,
+        "model_action_created",
+        "agent_runtime",
+        {
+            "model": result.model,
+            "kind": result.action.kind.value,
+            "tool_names": [item.name for item in result.action.tool_calls],
+            "reason_summary": result.action.reason_summary,
+            "total_tokens": result.total_tokens,
+        },
+    )
+    if result.action.kind == ModelActionKind.TOOL_CALLS:
+        return _model_tool_decision(
+            state,
+            raw_decision=raw_decision,
+            model_action=result.action,
+        ), None
+    if result.action.kind == ModelActionKind.REQUEST_USER_INPUT:
+        return None, _agentic_final_response(
+            state,
+            status="needs_more_info",
+            reason="request_user_input",
+            content=result.action.question or "需要你补充一项无法通过现有工具确定的信息。",
+        )
+    missing = _scientific_completion_missing(state)
+    if missing:
+        attempts = int(
+            state.runtime_context.get("scientific_completion_gate_attempts") or 0
+        )
+        state.runtime_context["scientific_completion_gate_attempts"] = attempts + 1
+        state.runtime_context["scientific_completion_missing"] = missing
+        record_agent_event(
+            state,
+            "scientific_completion_gate_blocked",
+            "agent_runtime",
+            {"missing": missing, "attempt": attempts + 1},
+        )
+        if attempts < 2 and _agentic_budget_exhausted(state) is None:
+            return _run_agentic_model_turn(state, raw_decision=raw_decision)
+        return None, _agentic_final_response(
+            state,
+            status="paused",
+            reason="scientific_completion_contract_incomplete",
+            content=(
+                "科学任务尚未满足完成契约，已保存当前结果且未创建审批、未批准、未执行。"
+                "需要继续补齐两个候选的验证、仿真、PlanPatch 与比较。"
+            ),
+            extra_output={
+                "outcome_status": "paused",
+                "remaining_work": missing,
+                "scientific_completion_contract": dict(
+                    (state.planning_context or {}).get("scientific_contract") or {}
+                ),
+            },
+        )
+    return None, _agentic_final_response(
+        state,
+        content=result.action.content or "调查已结束，但没有形成可可靠陈述的结论。",
+    )
 
 
 def _refresh_status_bar(state: AgentRunState, phase: str) -> None:
@@ -175,48 +983,62 @@ def _state_update(state: AgentRunState) -> dict[str, Any]:
 
 
 def _decision_target_id(raw_decision: Any) -> str | None:
-    target = getattr(raw_decision, "target", None)
-    return getattr(target, "canonical_id", None) if target else None
+    target = _value(raw_decision, "target")
+    return _value(target, "canonical_id") if target else None
+
+
+def _value(value: Any, key: str, default: Any = None) -> Any:
+    """Read observability data without assuming checkpoint-restored object types."""
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
 
 
 def _candidate_payload(candidate: Any) -> dict[str, Any]:
-    target = getattr(candidate, "target", None)
+    target = _value(candidate, "target")
     return {
-        "route_kind": _safe_value(getattr(candidate, "kind", None)),
-        "reason_code": _safe_value(getattr(candidate, "reason_code", None)),
-        "risk_level": _safe_value(getattr(candidate, "risk_level", None)),
-        "source": getattr(candidate, "source", "rule"),
-        "score": getattr(candidate, "score", None),
-        "evidence_items": list(getattr(candidate, "evidence_items", ()) or ()),
-        "negative_signals": list(getattr(candidate, "negative_signals", ()) or ()),
-        "selection_reason": getattr(candidate, "selection_reason", None),
-        "target": getattr(target, "canonical_id", None) if target else None,
+        "route_kind": _safe_value(_value(candidate, "kind")),
+        "reason_code": _safe_value(_value(candidate, "reason_code")),
+        "risk_level": _safe_value(_value(candidate, "risk_level")),
+        "source": _value(candidate, "source", "rule"),
+        "score": _value(candidate, "score"),
+        "evidence_items": list(_value(candidate, "evidence_items", ()) or ()),
+        "negative_signals": list(_value(candidate, "negative_signals", ()) or ()),
+        "selection_reason": _value(candidate, "selection_reason"),
+        "target": _value(target, "canonical_id") if target else None,
     }
 
 
 def _log_routing_decision(state: AgentRunState, raw_decision: Any, deps: AgentRuntimeDeps) -> None:
-    deps.append_decision_event(
-        {
+    try:
+        candidates = tuple(_value(raw_decision, "candidates", ()) or ())
+        payload = {
             "event": "chat_intent_routed",
             "session_id": state.session_id,
             "agent_run_id": state.agent_run_id,
-            "route_kind": _safe_value(raw_decision.kind),
-            "reason_code": _safe_value(raw_decision.reason_code),
-            "risk_level": _safe_value(raw_decision.risk_level),
-            "candidate_routes": [_safe_value(item.kind) for item in raw_decision.candidates],
-            "requires_clarification": _safe_value(raw_decision.kind) == "clarification",
+            "route_kind": _safe_value(_value(raw_decision, "kind")),
+            "reason_code": _safe_value(_value(raw_decision, "reason_code")),
+            "risk_level": _safe_value(_value(raw_decision, "risk_level")),
+            "candidate_routes": [_safe_value(_value(item, "kind")) for item in candidates],
+            "requires_clarification": _safe_value(_value(raw_decision, "kind")) == "clarification",
             "strain_id": _decision_target_id(raw_decision),
             "strain_ids": [
-                item.canonical_id
-                for candidate in raw_decision.candidates
-                for item in candidate.entity_options
-                if item.canonical_id
+                _value(item, "canonical_id")
+                for candidate in candidates
+                for item in (_value(candidate, "entity_options", ()) or ())
+                if _value(item, "canonical_id")
             ],
-            "plan_steps": [_safe_value(step.kind) for step in getattr(raw_decision, "steps", ())],
-            "selection_trace": getattr(raw_decision, "selection_trace", {}) or {},
-            "candidate_evidence": [_candidate_payload(item) for item in raw_decision.candidates],
+            "plan_steps": [
+                _safe_value(_value(step, "kind"))
+                for step in (_value(raw_decision, "steps", ()) or ())
+            ],
+            "selection_trace": _value(raw_decision, "selection_trace", {}) or {},
+            "candidate_evidence": [_candidate_payload(item) for item in candidates],
         }
-    )
+        deps.append_decision_event(payload)
+    except Exception:
+        # Observability must never be able to fail the agent run.
+        return
 
 
 def _active_plan_step(state: AgentRunState, decision: AgentDecision) -> AgentPlanStep | None:
@@ -363,16 +1185,30 @@ def _decide_action_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
     deps = get_runtime_deps()
     next_decision = deserialize_agent_decision(graph_state.get("next_decision"))
     if next_decision is None:
-        decision = decide_next_action(state, deps)
+        control_decision = decide_next_action(state, deps)
     else:
-        decision = next_decision
+        control_decision = next_decision
 
-    raw_decision = decision.raw_decision
-    if decision.route_kind == "scientific_task":
+    raw_decision = control_decision.raw_decision
+    if control_decision.route_kind == "scientific_task":
         # Scientific runs contain their own governed observation/verification
         # cycle and may resume after approval. Preserve the small ordinary-chat
         # budget while allowing the declared scientific ceiling.
         state.max_steps = max(state.max_steps, 24)
+        arguments = _value(raw_decision, "arguments", {}) or {}
+        state.planning_context["scientific_contract"] = {
+            "candidate_count": int(arguments.get("candidate_count") or 0),
+            "requested_capabilities": list(arguments.get("requested_capabilities") or []),
+            "simulation_policy": arguments.get("simulation_policy") or "none",
+            "proposal_requested": bool(arguments.get("proposal_requested")),
+            "completion_requires": [
+                "distinct_candidates",
+                "validation_per_candidate",
+                "simulation_per_candidate",
+                "plan_patch",
+                "comparison_benefit_risk_resources_uncertainty",
+            ],
+        }
     _build_targeted_context(state, raw_decision, deps)
     _log_routing_decision(state, raw_decision, deps)
     record_run_event(
@@ -381,14 +1217,66 @@ def _decide_action_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
         event_type="routed",
         layer="intent_router",
         payload={
-            "route_kind": decision.route_kind,
+            "route_kind": control_decision.route_kind,
             "reason_code": _safe_value(raw_decision.reason_code),
-            "risk_level": decision.risk_level,
+            "risk_level": control_decision.risk_level,
             "candidate_routes": [_safe_value(item.kind) for item in raw_decision.candidates],
             "selection_trace": getattr(raw_decision, "selection_trace", {}) or {},
             "candidate_evidence": [_candidate_payload(item) for item in raw_decision.candidates],
         },
     )
+    decision = control_decision
+    final_response: ChatResponse | None = None
+    should_ask_model = not (
+        next_decision is not None
+        and control_decision.decision_source == "llm_tool_loop_v2"
+    )
+    if _prepare_agentic_runtime(state, control_decision.route_kind) and should_ask_model:
+        try:
+            agentic_decision, agentic_response = _run_agentic_model_turn(
+                state,
+                raw_decision=raw_decision,
+            )
+            if _agentic_execution_enabled(state):
+                if agentic_decision is not None:
+                    decision = agentic_decision
+                elif agentic_response is not None:
+                    final_response = agentic_response
+            else:
+                record_agent_event(
+                    state,
+                    "agent_tool_loop_shadow_decision",
+                    "agent_runtime",
+                    {"model_action": state.last_model_action},
+                )
+        except Exception as exc:
+            record_agent_event(
+                state,
+                "legacy_fallback",
+                "agent_runtime",
+                {
+                    "reason": "native_function_calling_unavailable",
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            state.agentic_mode = "off"
+
+    if final_response is not None:
+        state.final_response = final_response
+        state.terminal_status = (
+            AgentTerminalStatus.NEEDS_MORE_INFO
+            if final_response.agent_output.get("status") == "needs_more_info"
+            else AgentTerminalStatus.SUCCEEDED
+        )
+        return {
+            **_state_update(state),
+            "current_step": {"index": state.step_index, "decision": None},
+            "decision": None,
+            "next_decision": None,
+            "response": serialize_chat_response(final_response),
+        }
+
     record_agent_event(
         state,
         "agent_decision_made",
@@ -408,6 +1296,12 @@ def _decide_action_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
         "decision": serialize_agent_decision(decision),
         "next_decision": None,
     }
+
+
+def _route_after_decide(graph_state: AgentRuntimeGraphState) -> str:
+    if graph_state.get("decision") is None and graph_state.get("final_response") is not None:
+        return "FinishRun"
+    return "EvaluatePolicy"
 
 
 def _evaluate_policy_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
@@ -474,6 +1368,325 @@ async def _execute_action_node(graph_state: AgentRuntimeGraphState) -> dict[str,
         "agent_runtime",
         {"action": action.to_event_payload()},
     )
+    if decision.decision_source == "llm_tool_loop_v2":
+        envelope = _safety_envelope_from_state(state)
+        tools = _resolved_tools_from_state(state)
+        tool_map = {item.name: item for item in tools}
+        raw_calls = tuple(
+            ModelToolCall(
+                tool_call_id=str(item.get("tool_call_id") or uuid.uuid4()),
+                name=str(item.get("name") or ""),
+                arguments=dict(item.get("arguments") or {}),
+            )
+            for item in (state.last_model_action.get("tool_calls") or ())
+        )
+        accepted: list[ModelToolCall] = []
+        rejected: list[ToolObservation] = []
+        prior_fingerprints = set(
+            state.runtime_context.get("tool_call_fingerprints") or []
+        )
+        accepted_fingerprints: set[str] = set()
+        for call in raw_calls:
+            tool = tool_map.get(call.name)
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {"tool": call.name, "arguments": call.arguments},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            budget_name = None
+            if (
+                tool
+                and tool.effect_class == EffectClass.READ.value
+                and (
+                    fingerprint in prior_fingerprints
+                    or fingerprint in accepted_fingerprints
+                )
+            ):
+                rejected.append(
+                    ToolObservation(
+                        observation_id=str(uuid.uuid4()),
+                        tool_call_id=call.tool_call_id,
+                        tool_name=call.name,
+                        status="error",
+                        effect_class=tool.effect_class,
+                        authority="control_state",
+                        error_code="no_progress_duplicate_call",
+                        error_details={
+                            "reason": "The same read tool and normalized arguments already ran in this agent run."
+                        },
+                        suggested_repairs=(
+                            "Change parameters or source.",
+                            "Use agent_artifact_read when the prior result was truncated.",
+                            "Finish with the evidence already collected.",
+                        ),
+                        retryable=False,
+                    )
+                )
+                record_agent_event(
+                    state,
+                    "no_progress_fuse_triggered",
+                    "agent_runtime",
+                    {"tool_name": call.name, "fingerprint": fingerprint},
+                )
+                continue
+            if state.tool_call_count + len(accepted) >= envelope.budgets.tool_calls:
+                budget_name = "tool_calls"
+            elif (
+                tool
+                and tool.executor_kind == "compute"
+                and state.compute_call_count
+                + sum(
+                    1
+                    for item in accepted
+                    if tool_map.get(item.name)
+                    and tool_map[item.name].executor_kind == "compute"
+                )
+                >= envelope.budgets.compute_calls
+            ):
+                budget_name = "compute_calls"
+            elif (
+                tool
+                and tool.effect_class == EffectClass.PROPOSAL_WRITE.value
+                and state.proposal_count
+                + sum(
+                    1
+                    for item in accepted
+                    if tool_map.get(item.name)
+                    and tool_map[item.name].effect_class == EffectClass.PROPOSAL_WRITE.value
+                )
+                >= envelope.budgets.proposals
+            ):
+                budget_name = "proposals"
+            if budget_name:
+                rejected.append(
+                    ToolObservation(
+                        observation_id=str(uuid.uuid4()),
+                        tool_call_id=call.tool_call_id,
+                        tool_name=call.name,
+                        status="error",
+                        effect_class=tool.effect_class if tool else EffectClass.READ.value,
+                        authority="control_state",
+                        error_code="budget_exhausted",
+                        error_details={"budget": budget_name},
+                        retryable=False,
+                    )
+                )
+            else:
+                accepted.append(call)
+                accepted_fingerprints.add(fingerprint)
+        observations = await execute_tool_calls(
+            tuple(accepted),
+            tools,
+            envelope,
+            session_id=state.session_id,
+            agent_run_id=state.agent_run_id,
+        )
+        observations.extend(rejected)
+        if accepted_fingerprints:
+            state.runtime_context["tool_call_fingerprints"] = sorted(
+                prior_fingerprints | accepted_fingerprints
+            )
+        order = {call.tool_call_id: index for index, call in enumerate(raw_calls)}
+        observations.sort(key=lambda item: order.get(item.tool_call_id, len(order)))
+        state.tool_call_count += len(accepted)
+        state.compute_call_count += sum(
+            1
+            for call in accepted
+            if tool_map.get(call.name)
+            and tool_map[call.name].executor_kind == "compute"
+        )
+        state.proposal_count += sum(
+            1
+            for call in accepted
+            if tool_map.get(call.name)
+            and tool_map[call.name].effect_class == EffectClass.PROPOSAL_WRITE.value
+        )
+        payloads = observation_dicts(observations)
+        state.v2_observations.extend(payloads)
+        for call in accepted:
+            record_agent_event(
+                state,
+                "tool_call_authorized",
+                "agent_runtime",
+                {
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.name,
+                    "effect_class": (
+                        tool_map[call.name].effect_class
+                        if call.name in tool_map
+                        else None
+                    ),
+                },
+            )
+        known_evidence_refs = {
+            ref.get("ref_id")
+            for item in state.v2_observations
+            for ref in item.get("evidence_refs") or []
+            if ref.get("ref_id")
+        }
+        for observation in observations:
+            if observation.status != "success":
+                continue
+            if observation.tool_name == "hypothesis_ledger_update":
+                validated_hypotheses: list[dict[str, Any]] = []
+                previous_hypotheses = {
+                    str(item.get("hypothesis_id")): item
+                    for item in state.hypotheses
+                    if item.get("hypothesis_id")
+                }
+                for hypothesis in observation.data.get("hypotheses") or []:
+                    item = dict(hypothesis)
+                    unknown = sorted(
+                        (
+                            set(item.get("supporting_evidence_refs") or [])
+                            | set(item.get("contradicting_evidence_refs") or [])
+                        )
+                        - known_evidence_refs
+                    )
+                    if unknown:
+                        item["supporting_evidence_refs"] = [
+                            ref
+                            for ref in item.get("supporting_evidence_refs") or []
+                            if ref in known_evidence_refs
+                        ]
+                        item["contradicting_evidence_refs"] = [
+                            ref
+                            for ref in item.get("contradicting_evidence_refs") or []
+                            if ref in known_evidence_refs
+                        ]
+                        item["uncertainties"] = list(item.get("uncertainties") or []) + [
+                            f"Unresolved evidence refs were rejected: {', '.join(unknown)}"
+                        ]
+                    previous = previous_hypotheses.get(str(item.get("hypothesis_id")))
+                    contradictions = list(item.get("contradicting_evidence_refs") or [])
+                    if contradictions and item.get("status") in {"active", "supported"}:
+                        previous_confidence = float(
+                            (previous or {}).get("confidence", item.get("confidence") or 0)
+                        )
+                        item["status"] = "weakened"
+                        item["confidence"] = max(
+                            0.0,
+                            min(float(item.get("confidence") or 0), previous_confidence - 0.15),
+                        )
+                    if previous and (
+                        previous.get("status") != item.get("status")
+                        or float(previous.get("confidence") or 0)
+                        != float(item.get("confidence") or 0)
+                    ):
+                        record_agent_event(
+                            state,
+                            "hypothesis_direction_changed",
+                            "agent_runtime",
+                            {
+                                "hypothesis_id": item.get("hypothesis_id"),
+                                "old_status": previous.get("status"),
+                                "new_status": item.get("status"),
+                                "old_confidence": previous.get("confidence"),
+                                "new_confidence": item.get("confidence"),
+                                "contradicting_evidence_refs": contradictions,
+                            },
+                        )
+                    item.setdefault("created_step", state.step_index)
+                    item["updated_step"] = state.step_index
+                    validated_hypotheses.append(item)
+                state.hypotheses = validated_hypotheses
+                record_agent_event(
+                    state,
+                    "hypothesis_updated",
+                    "agent_runtime",
+                    {
+                        "hypothesis_count": len(validated_hypotheses),
+                        "artifact_ref": observation.data.get("artifact_ref"),
+                    },
+                )
+            elif observation.tool_name == "candidate_plan_record":
+                candidate = dict(observation.data.get("candidate") or {})
+                if candidate:
+                    candidate["comparison_summary"] = observation.data.get("comparison_summary")
+                    state.candidate_plans = [
+                        item
+                        for item in state.candidate_plans
+                        if item.get("candidate_id") != candidate.get("candidate_id")
+                    ]
+                    state.candidate_plans.append(candidate)
+                    record_agent_event(
+                        state,
+                        "candidate_compared",
+                        "agent_runtime",
+                        {
+                            "candidate_id": candidate.get("candidate_id"),
+                            "candidate_count": len(state.candidate_plans),
+                            "artifact_ref": observation.data.get("artifact_ref"),
+                        },
+                    )
+            elif observation.tool_name == "plan_patch_record":
+                state.plan_patch_count += 1
+                record_agent_event(
+                    state,
+                    "plan_patch_created",
+                    "agent_runtime",
+                    {
+                        "plan_patch_count": state.plan_patch_count,
+                        "artifact_ref": observation.data.get("artifact_ref"),
+                    },
+                )
+        for observation in observations:
+            if observation.status == "proposal_not_ready":
+                record_agent_event(
+                    state,
+                    "proposal_abstained",
+                    "agent_runtime",
+                    {"observation": observation.to_model_payload()},
+                )
+            elif observation.pending_id is not None:
+                record_agent_event(
+                    state,
+                    "proposal_created",
+                    "agent_runtime",
+                    {
+                        "pending_id": observation.pending_id,
+                        "tool_call_id": observation.tool_call_id,
+                        "tool_name": observation.tool_name,
+                    },
+                )
+            event_type = (
+                "tool_call_denied"
+                if observation.error_code in {
+                    "policy_denied",
+                    "server_owned_argument",
+                    "tool_not_resolved",
+                    "safety_envelope_expired",
+                    "budget_exhausted",
+                }
+                else "tool_observation_created"
+            )
+            record_agent_event(
+                state,
+                event_type,
+                "agent_runtime",
+                {"observation": observation.to_model_payload()},
+            )
+        pending_ids = [
+            item.pending_id for item in observations if item.pending_id is not None
+        ]
+        aggregate_status = "pending" if pending_ids else "observation"
+        response = ChatResponse(
+            status="success",
+            session_id=state.session_id,
+            agent_output={
+                "action": "agent_tool_batch",
+                "status": aggregate_status,
+                "observations": payloads,
+                "pending_id": pending_ids[0] if pending_ids else None,
+                "require_confirmation": bool(pending_ids),
+                "trace_id": state.agent_run_id,
+            },
+            natural_reply="已取得结构化工具结果，Agent 将根据结果重新规划。",
+        )
+        return {**_state_update(state), "response": serialize_chat_response(response)}
     if state.loop_mode in {"read_only_composite", "composite_guarded"}:
         with defer_response_persistence():
             response = await execute_agent_action(action, state, deps)
@@ -744,7 +1957,13 @@ def _route_after_revalidate(graph_state: AgentRuntimeGraphState) -> str:
 async def _execute_approved_action_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
     state = _runtime_state(graph_state)
     pending_id = int((graph_state.get("approval_validation") or {}).get("pending_id"))
-    result = await strain_service.execute_approved_pending_action(pending_id)
+    queued = database.queue_pending_execution(pending_id)
+    result = {
+        "status": "queued" if queued else "error",
+        "action": "trusted_execution_queued",
+        "pending_id": pending_id,
+        "canonical_execution_pending": True,
+    }
     database.mark_pending_resume_completed(pending_id, result)
     payload = {
         "action": result.get("action") or "approved_pending_executed",
@@ -752,10 +1971,13 @@ async def _execute_approved_action_node(graph_state: AgentRuntimeGraphState) -> 
         "pending_id": pending_id,
         **result,
     }
-    natural_reply = result.get("msg") or result.get("message") or f"Pending {pending_id} review completed."
+    natural_reply = (
+        f"Pending {pending_id} was approved and queued for the trusted worker. "
+        "Execution is not considered successful until canonical state is updated."
+    )
     response = _complete_response_from_payload(state, payload, natural_reply)
     state.final_response = response
-    state.terminal_status = AgentTerminalStatus.SUCCEEDED if result.get("status") == "success" else AgentTerminalStatus.FAILED
+    state.terminal_status = AgentTerminalStatus.WAITING_APPROVAL if queued else AgentTerminalStatus.FAILED
     record_agent_event(
         state,
         "graph_run_completed_after_resume",
@@ -872,15 +2094,16 @@ def _route_after_verify(graph_state: AgentRuntimeGraphState) -> str:
 
 def _mark_waiting_input_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
     state = _runtime_state(graph_state)
+    paused = state.terminal_status == AgentTerminalStatus.PAUSED
     finish_run(
         state.agent_run_id,
-        status=AgentTerminalStatus.NEEDS_MORE_INFO.value,
+        status=AgentTerminalStatus.PAUSED.value if paused else AgentTerminalStatus.NEEDS_MORE_INFO.value,
         final_route=state.initial_route_kind,
         response_summary=(state.final_response.natural_reply if state.final_response else "")[:500],
     )
     record_agent_event(
         state,
-        "agent_task_waiting_input",
+        "agent_task_paused" if paused else "agent_task_waiting_input",
         "agent_runtime",
         {"task_id": state.task_id, "task_state_version": state.task_state_version},
     )
@@ -889,9 +2112,10 @@ def _mark_waiting_input_node(graph_state: AgentRuntimeGraphState) -> dict[str, A
 
 def _await_task_input_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
     state = _runtime_state(graph_state)
+    paused = state.terminal_status == AgentTerminalStatus.PAUSED
     resumed = interrupt(
         {
-            "reason": "conversation_task_missing_slots",
+            "reason": "budget_pause" if paused else "conversation_task_missing_slots",
             "task_id": state.task_id,
             "task_state_version": state.task_state_version,
             "missing_fields": list(state.missing_fields or []),
@@ -918,8 +2142,28 @@ def _await_task_input_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any
     state.loop_plan_index = 0
     state.next_decision = None
     state.missing_fields = []
+    state.model_turn_count = 0
+    state.tool_call_count = 0
+    state.compute_call_count = 0
+    state.proposal_count = 0
+    state.cumulative_model_tokens = 0
+    state.agentic_started_at = time.monotonic()
     state.conversation_history = get_runtime_deps().get_session_memory(state.session_id)
     state.conversation_history.append({"role": "user", "content": state.user_message})
+    resumed_decision = None
+    if current.get("task_type") == "email" and current.get("status") == "collecting":
+        email_spec = resume_email_request(current, state.user_message)
+        resumed_decision = decision_from_routing_decision(
+            EmailDecision(
+                reason_code=ReasonCode.EMAIL_MATCHED,
+                risk_level=RiskLevel.MEDIUM,
+                explanation="The message supplies fields for the active email task.",
+                source_text=email_spec.source_message,
+                request_spec=email_spec.to_dict(),
+            ),
+            state,
+        )
+        state.next_decision = resumed_decision
     record_agent_event(
         state,
         "agent_task_input_resumed",
@@ -937,7 +2181,11 @@ def _await_task_input_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any
         "policy": None,
         "response": None,
         "directive": None,
-        "next_decision": None,
+        "next_decision": (
+            serialize_agent_decision(resumed_decision)
+            if resumed_decision is not None
+            else None
+        ),
         "final_response": None,
     }
 
@@ -959,6 +2207,108 @@ def _replan_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
     step.terminal_status = state.terminal_status
     if step.observation is not None and state.terminal_status is not None:
         step.observation_assessment = assess_observation(step.observation, state.terminal_status)
+
+    prior_decision = deserialize_agent_decision(graph_state.get("decision"))
+    if (
+        prior_decision is not None
+        and prior_decision.decision_source == "llm_tool_loop_v2"
+        and _agentic_execution_enabled(state)
+    ):
+        previous_model_tools = [
+            item.get("name")
+            for item in state.last_model_action.get("tool_calls") or []
+        ]
+        try:
+            next_decision, final_response = _run_agentic_model_turn(
+                state,
+                raw_decision=prior_decision.raw_decision,
+            )
+        except Exception as exc:
+            record_agent_event(
+                state,
+                "agentic_replan_failed",
+                "agent_runtime",
+                {"error_type": type(exc).__name__, "error_message": str(exc)},
+            )
+            next_decision = None
+            final_response = _agentic_final_response(
+                state,
+                status="partial",
+                reason="model_replan_failed",
+                content=(
+                    "已保存当前调查 checkpoint，但模型重规划调用失败。"
+                    "现有工具结果仍保留在 Trace 中，未创建或执行新的副作用。"
+                ),
+            )
+        if next_decision is not None:
+            if next_decision.action_name not in previous_model_tools:
+                record_agent_event(
+                    state,
+                    "plan_changed_after_observation",
+                    "agent_runtime",
+                    {
+                        "previous_tools": previous_model_tools,
+                        "next_tool": next_decision.action_name,
+                    },
+                )
+            directive = {
+                "should_continue": True,
+                "reason": "llm_replanned_after_observation",
+                "next_step_index": state.step_index + 1,
+                "terminal_status": None,
+                "finalize_composite": False,
+                "replan_source": "llm_tool_loop_v2",
+            }
+            state.terminal_status = None
+            record_agent_event(
+                state,
+                "agent_loop_continue",
+                "agent_runtime",
+                {
+                    "next_decision": next_decision.to_event_payload(),
+                    "source": "llm_tool_loop_v2",
+                },
+            )
+            _refresh_status_bar(state, "replan")
+            return {
+                **_state_update(state),
+                "directive": directive,
+                "next_decision": serialize_agent_decision(next_decision),
+            }
+        if final_response is not None:
+            state.final_response = final_response
+            final_status = final_response.agent_output.get("status")
+            if final_status == "needs_more_info":
+                state.terminal_status = AgentTerminalStatus.NEEDS_MORE_INFO
+            elif final_status == "partial":
+                state.terminal_status = AgentTerminalStatus.MAX_STEPS_REACHED
+            elif final_status == "paused":
+                state.terminal_status = AgentTerminalStatus.PAUSED
+            else:
+                state.terminal_status = AgentTerminalStatus.SUCCEEDED
+            state.loop_stop_reason = final_response.agent_output.get("reason") or "model_final_answer"
+            directive = {
+                "should_continue": False,
+                "reason": state.loop_stop_reason,
+                "next_step_index": None,
+                "terminal_status": state.terminal_status.value,
+                "finalize_composite": False,
+                "replan_source": "llm_tool_loop_v2",
+            }
+            record_agent_event(
+                state,
+                "agent_loop_stopped",
+                "agent_runtime",
+                {"directive": directive},
+            )
+            _refresh_status_bar(state, "replan")
+            return {
+                **_state_update(state),
+                "directive": directive,
+                "next_decision": None,
+                "response": serialize_chat_response(final_response),
+            }
+
     directive = build_replan_directive(state, step)
     state.replan_history.append(directive.to_event_payload())
     record_agent_event(state, "agent_replan_directive_created", "agent_runtime", {"directive": directive.to_event_payload()})
@@ -1007,6 +2357,9 @@ def _replan_node(graph_state: AgentRuntimeGraphState) -> dict[str, Any]:
 
 
 def _route_after_replan(graph_state: AgentRuntimeGraphState) -> str:
+    state = _runtime_state(graph_state)
+    if state.terminal_status == AgentTerminalStatus.PAUSED and state.task_id:
+        return "MarkWaitingInput"
     directive = graph_state.get("directive") or {}
     if directive.get("should_continue") and graph_state.get("next_decision") is not None:
         return "BeginStep"
@@ -1093,7 +2446,14 @@ def build_agent_runtime_graph(*, checkpointer: Any | None = None):
     graph.add_edge("InitializeRun", "BeginStep")
     graph.add_edge("BeginStep", "BuildContext")
     graph.add_edge("BuildContext", "DecideAction")
-    graph.add_edge("DecideAction", "EvaluatePolicy")
+    graph.add_conditional_edges(
+        "DecideAction",
+        _route_after_decide,
+        {
+            "EvaluatePolicy": "EvaluatePolicy",
+            "FinishRun": "FinishRun",
+        },
+    )
     graph.add_conditional_edges(
         "EvaluatePolicy",
         _route_after_policy,
@@ -1137,7 +2497,11 @@ def build_agent_runtime_graph(*, checkpointer: Any | None = None):
     graph.add_conditional_edges(
         "Replan",
         _route_after_replan,
-        {"BeginStep": "BeginStep", "FinishRun": "FinishRun"},
+        {
+            "BeginStep": "BeginStep",
+            "MarkWaitingInput": "MarkWaitingInput",
+            "FinishRun": "FinishRun",
+        },
     )
     graph.add_edge("FinishRun", END)
     return graph.compile(checkpointer=checkpointer)
@@ -1236,7 +2600,31 @@ async def run_agent_graph_loop(
         return final_state.final_response
     except Exception as exc:
         decision = _last_decision_from_graph(graph_state)
-        state.last_error = {"error_type": type(exc).__name__, "error_message": str(exc)}
+        from app.core.provider_errors import safe_provider_error
+
+        failure = safe_provider_error(exc)
+        state.last_error = {
+            **failure,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+        state.terminal_status = AgentTerminalStatus.FAILED
+        state.final_response = ChatResponse(
+            status="failed",
+            session_id=state.session_id,
+            agent_status=AgentTerminalStatus.FAILED.value,
+            agent_output={
+                "action": "assistant_error",
+                "status": "failed",
+                "outcome_status": "failed",
+                "error_code": failure["code"],
+                "error_category": failure["category"],
+                "retryable": failure["retryable"],
+                "agent_run_id": state.agent_run_id,
+                "task_id": state.task_id,
+            },
+            natural_reply=failure["public_message"],
+        )
         error_event_id = record_error_event(
             session_id=state.session_id,
             agent_run_id=state.agent_run_id,
@@ -1262,6 +2650,32 @@ async def run_agent_graph_loop(
             layer="chat_service",
             payload={"error_event_id": error_event_id, "failure_stage": "handle_chat", "failure_layer": "chat_service"},
         )
+        if state.task_id:
+            try:
+                task = conversation_tasks.get_task(state.task_id)
+                if task and task.get("status") not in conversation_tasks.TERMINAL_STATUSES:
+                    conversation_tasks.update_task(
+                        state.task_id,
+                        status="failed",
+                        proposed_action={
+                            **(task.get("proposed_action") or {}),
+                            "failure": state.last_error,
+                        },
+                        event_type="task_failed",
+                    )
+            except Exception:
+                pass
+        try:
+            if hasattr(app, "aupdate_state"):
+                await app.aupdate_state(
+                    config,
+                    {
+                        "runtime_state": serialize_runtime_state(state),
+                        "final_response": serialize_chat_response(state.final_response),
+                    },
+                )
+        except Exception:
+            pass
         try:
             run_post_run_learning_review(
                 agent_run_id=state.agent_run_id,

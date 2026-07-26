@@ -22,10 +22,25 @@ from app.services.intent import routing_models as rm
 from app.services.context.status_bar import build_status_bar
 
 
-STATE_SCHEMA_VERSION = 1
-GRAPH_DEFINITION_VERSION = "agent-runtime-graph-v1"
-DECISION_SCHEMA_VERSION = 1
-ACTION_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 3
+GRAPH_DEFINITION_VERSION = "agent-runtime-graph-v2"
+DECISION_SCHEMA_VERSION = 3
+ACTION_SCHEMA_VERSION = 2
+
+LEGACY_GRAPH_VERSIONS = {
+    (
+        1,
+        "agent-runtime-graph-v1",
+        1,
+        1,
+    ),
+    (
+        2,
+        "agent-runtime-graph-v2",
+        2,
+        2,
+    ),
+}
 
 
 def _safe(value: Any) -> Any:
@@ -71,7 +86,14 @@ def serialize_routing_decision(decision: Any) -> dict[str, Any] | None:
 def _enum(enum_cls, value):
     if value is None or isinstance(value, enum_cls):
         return value
-    return enum_cls(value)
+    if isinstance(value, dict) and set(value) == {"value"}:
+        value = value["value"]
+    try:
+        return enum_cls(value)
+    except (TypeError, ValueError):
+        # Unknown future/hostile enum values must survive checkpoint recovery so
+        # the policy layer can reject them; deserialization is not authorization.
+        return value
 
 
 def _entity(payload: dict[str, Any] | None):
@@ -115,9 +137,25 @@ def deserialize_routing_decision(payload: dict[str, Any] | None) -> Any:
     decision_type = payload.get("_decision_type")
     if decision_type in {"SimpleNamespace", "namespace"}:
         data = {key: value for key, value in payload.items() if key != "_decision_type"}
+        data["target"] = _entity(data.get("target"))
+        data["entity_options"] = tuple(
+            _entity(item)
+            for item in data.get("entity_options") or ()
+            if isinstance(item, dict)
+        )
         data["candidates"] = tuple(
-            SimpleNamespace(**item) if isinstance(item, dict) else item
+            _candidate(item)
+            if isinstance(item, dict) and item.get("kind") is not None
+            else SimpleNamespace(**item)
+            if isinstance(item, dict)
+            else item
             for item in data.get("candidates") or ()
+        )
+        data["steps"] = tuple(
+            deserialize_routing_decision(item)
+            if isinstance(item, dict) and item.get("_decision_type")
+            else item
+            for item in data.get("steps") or ()
         )
         return SimpleNamespace(**data)
     common = {
@@ -132,7 +170,15 @@ def deserialize_routing_decision(payload: dict[str, Any] | None) -> Any:
     if decision_type == "ToolInfoDecision":
         return rm.ToolInfoDecision(**common)
     if decision_type == "EmailDecision":
-        return rm.EmailDecision(**common)
+        return rm.EmailDecision(
+            **common,
+            request_spec=payload.get("request_spec") or {},
+        )
+    if decision_type == "ForbiddenDecision":
+        return rm.ForbiddenDecision(
+            **common,
+            capability_request=payload.get("capability_request") or {},
+        )
     if decision_type == "QueryDecision":
         return rm.QueryDecision(
             **common,
@@ -172,6 +218,12 @@ def deserialize_routing_decision(payload: dict[str, Any] | None) -> Any:
             speech_act=_enum(rm.SpeechAct, payload.get("speech_act")) or rm.SpeechAct.DIAGNOSTIC,
             pending_id=payload.get("pending_id"),
             workflow_name=payload.get("workflow_name") or "subculture",
+        )
+    if decision_type == "ScientificTaskDecision":
+        return rm.ScientificTaskDecision(
+            **common,
+            arguments=payload.get("arguments") or {},
+            missing_fields=tuple(payload.get("missing_fields") or ()),
         )
     if decision_type == "ChatDecision":
         return rm.ChatDecision(**common)
@@ -262,6 +314,21 @@ def serialize_runtime_state(state: AgentRunState) -> dict[str, Any]:
         "dynamic_plan_count": state.dynamic_plan_count,
         "max_dynamic_replans": state.max_dynamic_replans,
         "planning_context": state.planning_context,
+        "agentic_state_schema_version": state.agentic_state_schema_version,
+        "agentic_mode": state.agentic_mode,
+        "safety_envelope": state.safety_envelope,
+        "resolved_tools": state.resolved_tools,
+        "v2_observations": state.v2_observations,
+        "hypotheses": state.hypotheses,
+        "candidate_plans": state.candidate_plans,
+        "model_turn_count": state.model_turn_count,
+        "tool_call_count": state.tool_call_count,
+        "compute_call_count": state.compute_call_count,
+        "proposal_count": state.proposal_count,
+        "plan_patch_count": state.plan_patch_count,
+        "cumulative_model_tokens": state.cumulative_model_tokens,
+        "agentic_started_at": state.agentic_started_at,
+        "last_model_action": state.last_model_action,
         "terminal_status": state.terminal_status.value if state.terminal_status else None,
         "final_response": serialize_chat_response(state.final_response),
         "last_error": state.last_error,
@@ -347,6 +414,21 @@ def deserialize_runtime_state(payload: dict[str, Any]) -> AgentRunState:
     state.dynamic_plan_count = int(payload.get("dynamic_plan_count") or 0)
     state.max_dynamic_replans = int(payload.get("max_dynamic_replans") or 2)
     state.planning_context = payload.get("planning_context") or {}
+    state.agentic_state_schema_version = int(payload.get("agentic_state_schema_version") or 2)
+    state.agentic_mode = payload.get("agentic_mode")
+    state.safety_envelope = dict(payload.get("safety_envelope") or {})
+    state.resolved_tools = list(payload.get("resolved_tools") or [])
+    state.v2_observations = list(payload.get("v2_observations") or [])
+    state.hypotheses = list(payload.get("hypotheses") or [])
+    state.candidate_plans = list(payload.get("candidate_plans") or [])
+    state.model_turn_count = int(payload.get("model_turn_count") or 0)
+    state.tool_call_count = int(payload.get("tool_call_count") or 0)
+    state.compute_call_count = int(payload.get("compute_call_count") or 0)
+    state.proposal_count = int(payload.get("proposal_count") or 0)
+    state.plan_patch_count = int(payload.get("plan_patch_count") or 0)
+    state.cumulative_model_tokens = int(payload.get("cumulative_model_tokens") or 0)
+    state.agentic_started_at = payload.get("agentic_started_at")
+    state.last_model_action = dict(payload.get("last_model_action") or {})
     state.terminal_status = AgentTerminalStatus(payload["terminal_status"]) if payload.get("terminal_status") else None
     state.final_response = deserialize_chat_response(payload.get("final_response"))
     state.last_error = payload.get("last_error")
@@ -392,9 +474,15 @@ def deserialize_policy(payload: dict[str, Any] | None) -> AgentPolicyVerdict | N
 
 
 def validate_graph_versions(graph_state: dict[str, Any]) -> bool:
-    return (
-        graph_state.get("state_schema_version") == STATE_SCHEMA_VERSION
-        and graph_state.get("graph_definition_version") == GRAPH_DEFINITION_VERSION
-        and graph_state.get("decision_schema_version") == DECISION_SCHEMA_VERSION
-        and graph_state.get("action_schema_version") == ACTION_SCHEMA_VERSION
+    versions = (
+        graph_state.get("state_schema_version"),
+        graph_state.get("graph_definition_version"),
+        graph_state.get("decision_schema_version"),
+        graph_state.get("action_schema_version"),
     )
+    return versions == (
+        STATE_SCHEMA_VERSION,
+        GRAPH_DEFINITION_VERSION,
+        DECISION_SCHEMA_VERSION,
+        ACTION_SCHEMA_VERSION,
+    ) or versions in LEGACY_GRAPH_VERSIONS

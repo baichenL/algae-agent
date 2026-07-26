@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class RouteKind(str, Enum):
+    POLICY_REJECTED = "policy_rejected"
     TOOL_INFO = "tool_info"
     EMAIL = "email"
     LAB_QUERY = "lab_query"
@@ -37,6 +38,7 @@ class SpeechAct(str, Enum):
     DIAGNOSTIC = "diagnostic"
     CONFIRM = "confirm"
     CANCEL = "cancel"
+    SUSPEND = "suspend"
     SLOT_VALUE = "slot_value"
     QUERY = "query"
 
@@ -49,6 +51,7 @@ class RiskLevel(str, Enum):
 
 
 class ReasonCode(str, Enum):
+    POLICY_CAPABILITY_FORBIDDEN = "policy_capability_forbidden"
     TOOL_INFO_MATCHED = "tool_info_matched"
     EMAIL_MATCHED = "email_matched"
     LAB_QUERY_MATCHED = "lab_query_matched"
@@ -164,6 +167,7 @@ class ToolInfoDecision(BaseDecision):
 
 @dataclass(frozen=True, kw_only=True)
 class EmailDecision(BaseDecision):
+    request_spec: dict[str, Any] = field(default_factory=dict)
     kind: Literal[RouteKind.EMAIL] = RouteKind.EMAIL
 
 
@@ -176,7 +180,7 @@ class QueryDecision(BaseDecision):
 
 @dataclass(frozen=True, kw_only=True)
 class PendingFormDecision(BaseDecision):
-    form_action: Literal["cancel", "continue", "conflict", "start"]
+    form_action: Literal["cancel", "suspend", "continue", "conflict", "start"]
     operation: str | None = None
     tool_name: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
@@ -227,6 +231,12 @@ class ChatDecision(BaseDecision):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ForbiddenDecision(BaseDecision):
+    capability_request: dict[str, Any] = field(default_factory=dict)
+    kind: Literal[RouteKind.POLICY_REJECTED] = RouteKind.POLICY_REJECTED
+
+
+@dataclass(frozen=True, kw_only=True)
 class ClarificationDecision(BaseDecision):
     questions: tuple[str, ...] = field(default_factory=tuple)
     response_action: str = "routing_clarification"
@@ -242,7 +252,8 @@ class CompositeDecision(BaseDecision):
 
 
 RoutingDecision: TypeAlias = (
-    ToolInfoDecision
+    ForbiddenDecision
+    | ToolInfoDecision
     | EmailDecision
     | QueryDecision
     | PendingFormDecision

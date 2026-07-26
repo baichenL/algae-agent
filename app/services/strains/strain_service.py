@@ -602,7 +602,12 @@ async def approve_pending_action_async(action_id: int) -> Dict[str, Any]:
     return await approve_workflow_pending(action_id)
 
 
-async def execute_approved_pending_action(action_id: int) -> Dict[str, Any]:
+async def execute_approved_pending_action(
+    action_id: int,
+    *,
+    execution_idempotency_key: str | None = None,
+    finalize_pending: bool = True,
+) -> Dict[str, Any]:
     pending = get_pending_action(action_id)
     if not pending:
         return {"status": "error", "reason": "not_found", "pending_id": action_id}
@@ -634,6 +639,31 @@ async def execute_approved_pending_action(action_id: int) -> Dict[str, Any]:
     payload = pending.get("payload", {})
     action_type = payload.get("type")
     data = payload.get("data", {})
+    if (
+        execution_idempotency_key
+        and action_type in {"add_strain", "update_strain", "delete_strain"}
+    ):
+        result = database.apply_strain_mutation_once(
+            action_type=action_type,
+            data=data,
+            execution_idempotency_key=execution_idempotency_key,
+        )
+        if result.get("status") == "success":
+            append_decision_event(
+                {
+                    "event": "approved_pending_executed",
+                    "pending_id": action_id,
+                    "action_type": action_type,
+                    "strain_id": data.get("strain_id"),
+                    "agent_run_id": data.get("agent_run_id"),
+                    "session_id": data.get("session_id"),
+                    "execution_idempotency_key": execution_idempotency_key,
+                }
+            )
+            result["pending_id"] = action_id
+            if finalize_pending:
+                database.mark_pending_executed(action_id, result)
+        return result
     if action_type == "workflow_subculture":
         from app.services.workflows.workflow_approval_service import approve_workflow_pending
 
@@ -706,7 +736,8 @@ async def execute_approved_pending_action(action_id: int) -> Dict[str, Any]:
             "agent_run_id": data.get("agent_run_id"),
             "session_id": data.get("session_id"),
         })
-        database.mark_pending_executed(action_id, result)
+        if finalize_pending:
+            database.mark_pending_executed(action_id, result)
         return result
     except Exception as exc:
         return {"status": "error", "reason": str(exc), "pending_id": action_id}

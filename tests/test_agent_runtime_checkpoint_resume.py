@@ -3,6 +3,7 @@ import ast
 import inspect
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -23,10 +24,18 @@ from app.services.agent_runtime.serialization import (
     DECISION_SCHEMA_VERSION,
     GRAPH_DEFINITION_VERSION,
     STATE_SCHEMA_VERSION,
+    deserialize_runtime_state,
     serialize_runtime_state,
     validate_graph_versions,
 )
-from app.services.agent_runtime.state import AgentRunState
+from app.services.agent_runtime.state import AgentDecision, AgentRunState
+from app.services.intent.routing_models import (
+    EntityRef,
+    ReasonCode,
+    RiskLevel,
+    RouteCandidate,
+    RouteKind,
+)
 from app.services.strains import strain_service
 
 
@@ -70,6 +79,84 @@ def test_sqlite_checkpointer_compiles_interrupts_and_resumes(tmp_path):
         second = await app.ainvoke(Command(resume={"decision": "approved"}), config=config)
         assert second["approval"] == {"decision": "approved"}
         await conn.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_checkpoint_close_reopen_restores_nested_entity_types(tmp_path):
+    async def run():
+        checkpoint_path = tmp_path / "nested-entity-checkpoints.sqlite"
+        entity = EntityRef(
+            entity_type="strain",
+            canonical_id="Chlamydomonas_01",
+            mention="Chlamydomonas_01",
+            source="explicit_id",
+            exists=True,
+        )
+        candidate = RouteCandidate(
+            kind=RouteKind.SCIENTIFIC_TASK,
+            reason_code=ReasonCode.SCIENTIFIC_TASK_MATCHED,
+            risk_level=RiskLevel.LOW,
+            evidence="two candidate request",
+            entity_options=(entity,),
+        )
+        runtime = AgentRunState(
+            agent_run_id="sqlite-nested-run",
+            session_id="sqlite-nested-session",
+            user_message="generate two candidates",
+            conversation_history=[],
+        )
+        runtime.steps = []
+        runtime.runtime_context["routing_decision"] = {
+            "candidate": candidate,
+        }
+        runtime.loop_plan = [
+            AgentDecision(
+                route_kind="scientific_task",
+                action_type="read",
+                action_name="scientific_dataset_get",
+                action_args={"strain_id": "Chlamydomonas_01"},
+                risk_level="low",
+                requires_approval=False,
+                missing_fields=[],
+                can_continue=True,
+                reason="checkpoint test",
+                raw_decision=SimpleNamespace(
+                    kind=RouteKind.SCIENTIFIC_TASK,
+                    target=entity,
+                    entity_options=(entity,),
+                    candidates=(candidate,),
+                ),
+            )
+        ]
+
+        graph = StateGraph(dict)
+        graph.add_node("persist", lambda state: state)
+        graph.add_edge(START, "persist")
+        graph.add_edge("persist", END)
+        config = {"configurable": {"thread_id": "sqlite-nested-thread"}}
+
+        first_connection = await aiosqlite.connect(checkpoint_path)
+        first_saver = AsyncSqliteSaver(first_connection)
+        await first_saver.setup()
+        first_app = graph.compile(checkpointer=first_saver)
+        await first_app.ainvoke(
+            {"runtime_state": serialize_runtime_state(runtime)},
+            config=config,
+        )
+        await first_connection.close()
+
+        second_connection = await aiosqlite.connect(checkpoint_path)
+        second_saver = AsyncSqliteSaver(second_connection)
+        second_app = graph.compile(checkpointer=second_saver)
+        snapshot = await second_app.aget_state(config)
+        restored = deserialize_runtime_state(snapshot.values["runtime_state"])
+        await second_connection.close()
+
+        raw = restored.loop_plan[0].raw_decision
+        assert raw.target.canonical_id == "Chlamydomonas_01"
+        assert raw.entity_options[0].canonical_id == "Chlamydomonas_01"
+        assert raw.candidates[0].entity_options[0].canonical_id == "Chlamydomonas_01"
 
     asyncio.run(run())
 
