@@ -80,6 +80,7 @@ def _manual_transfer_node(
     destination: str,
     container: str,
     instruction: str,
+    automated_carrier: str,
 ) -> dict[str, Any]:
     task = {
         "task_id": task_id,
@@ -89,6 +90,7 @@ def _manual_transfer_node(
         "destination": destination,
         "container": container,
         "instruction": instruction,
+        "automated_carrier": automated_carrier,
     }
     mode = state.get("interaction_mode", "legacy")
     resolution = (
@@ -115,6 +117,7 @@ def _manual_transfer_node(
         task_id=task_id,
         location=destination,
         container=container,
+        carrier=automated_carrier if mode == "demo" else "human_operator",
     )
     return _apply_hardware_result(
         state,
@@ -134,11 +137,46 @@ def manual_load_spectrophotometer_node(
         controller=controller,
         task_id="load_spectrophotometer",
         step="ManualLoadSpectrophotometer",
-        title="将培养样品放入分光光度计",
-        source="人工操作区",
-        destination="spectrophotometer",
-        container="source_flask",
-        instruction="取源三角烧瓶样品，装入比色皿并放入分光光度计。",
+        title="将检测孔板交接到酶标仪",
+        source="liquid_handler",
+        destination="plate_reader",
+        container="measurement_plate",
+        instruction="确认检测孔板已完成加样，并将其放入酶标仪托盘。",
+        automated_carrier="robot_arm",
+    )
+
+
+def prepare_measurement_plate_node(
+    state: AlgaeSubcultureState,
+    *,
+    controller: HardwareController | None = None,
+) -> dict[str, Any]:
+    result = _hardware(controller).liquid_handler.prepare_measurement_plate(
+        sample_volume_ml=0.2,
+        blank_volume_ml=0.2,
+    )
+    return _apply_hardware_result(
+        state,
+        step="PrepareMeasurementPlate",
+        result=result,
+    )
+
+
+def store_measurement_plate_node(
+    state: AlgaeSubcultureState,
+    *,
+    controller: HardwareController | None = None,
+) -> dict[str, Any]:
+    result = _hardware(controller).relocate_sample(
+        task_id="store_measurement_plate",
+        location="completed_plate_stack",
+        container="measurement_plate",
+        carrier="robot_arm",
+    )
+    return _apply_hardware_result(
+        state,
+        step="StoreMeasurementPlate",
+        result=result,
     )
 
 
@@ -185,11 +223,12 @@ def manual_load_liquid_handler_node(
         controller=controller,
         task_id="load_liquid_handler",
         step="ManualLoadLiquidHandler",
-        title="装载移液平台",
+        title="装载培养瓶、培养基和检测孔板",
         source="人工操作区",
         destination="liquid_handler",
-        container="source_and_target_flasks",
-        instruction="放置源三角烧瓶、目标三角烧瓶、培养基和所需耗材。",
+        container="workcell_labware",
+        instruction="放置源培养瓶、目标培养瓶、培养基、空 96 孔板和所需耗材。",
+        automated_carrier="robot_arm",
     )
 
 
@@ -271,6 +310,7 @@ def manual_move_to_incubator_node(
         destination="incubator",
         container="target_flask",
         instruction="取下已封口的目标三角烧瓶，并放入指定培养箱位置。",
+        automated_carrier="mobile_robot",
     )
 
 

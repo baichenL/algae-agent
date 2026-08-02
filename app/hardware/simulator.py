@@ -12,6 +12,7 @@ from app.hardware.devices import (
     SimulatedLiquidHandler,
     SimulatedSpectrophotometer,
 )
+from app.hardware.motion import MOTION_SCHEMA_VERSION, build_motion_command
 
 
 EventSink = Callable[[dict[str, Any]], None]
@@ -37,6 +38,7 @@ class SimulatedHardware:
         self.event_sink = event_sink
         self._lock = threading.RLock()
         self._sequence = 0
+        self._simulation_time_ms = 0
         self._events: list[dict[str, Any]] = []
         self._state: dict[str, Any] = {
             "phase": "IDLE",
@@ -68,6 +70,43 @@ class SimulatedHardware:
                 "absorbance": None,
                 "blanked": False,
             },
+            "plate_reader": {
+                "status": "STANDBY",
+                "door_state": "CLOSED",
+                "tray_state": "HOME",
+                "wavelength_nm": 680.0,
+                "absorbance": None,
+                "blanked": False,
+            },
+            "measurement_plate": {
+                "id": "measurement_plate_1",
+                "plate_type": "96_well",
+                "location": "plate_stack",
+                "sample_well": "A1",
+                "blank_well": "A2",
+                "sample_volume_ml": 0.0,
+                "blank_volume_ml": 0.0,
+                "status": "EMPTY",
+            },
+            "robot_arm": {
+                "status": "STANDBY",
+                "pose": "HOME",
+                "gripper_state": "OPEN",
+            },
+            "mobile_robot": {
+                "status": "STANDBY",
+                "location": "home",
+                "pose": "HOME",
+                "gripper_state": "OPEN",
+            },
+            "transport": {
+                "carrier": None,
+                "labware_id": None,
+                "source_location": None,
+                "target_location": None,
+                "motion_phase": "IDLE",
+                "progress": 0.0,
+            },
             "liquid_handler": {
                 "status": "STANDBY",
                 "progress": 0.0,
@@ -77,6 +116,29 @@ class SimulatedHardware:
                 "container": "source_flask",
                 "container_type": "erlenmeyer_flask",
                 "location": "manual_zone",
+            },
+            "motion_schema_version": MOTION_SCHEMA_VERSION,
+            "simulation_time_ms": 0,
+            "entities": {
+                "source_flask": {"entity_type": "culture_flask", "location": "manual_zone", "parent_id": "manual_handoff.source_slot"},
+                "target_flask": {"entity_type": "culture_flask", "location": "manual_zone", "parent_id": "manual_handoff.target_slot"},
+                "media_bottle": {"entity_type": "media_bottle", "location": "manual_zone", "parent_id": "manual_handoff.media_slot"},
+                "measurement_plate": {"entity_type": "microplate_96", "location": "plate_stack", "parent_id": "plate_stack.slot_1"},
+            },
+            "attachments": {
+                "source_flask": "manual_handoff.source_slot",
+                "target_flask": "manual_handoff.target_slot",
+                "media_bottle": "manual_handoff.media_slot",
+                "measurement_plate": "plate_stack.slot_1",
+            },
+            "resource_occupancy": {},
+            "active_commands": [],
+            "device_interlocks": {
+                "liquid_handler_door": "CLOSED",
+                "plate_reader_door": "CLOSED",
+                "plate_reader_tray": "HOME",
+                "incubator_door": "CLOSED",
+                "media_valve": "OPEN",
             },
             "alarm": None,
         }
@@ -92,6 +154,13 @@ class SimulatedHardware:
         if self.delay_seconds:
             time.sleep(self.delay_seconds)
 
+    def _set_attachment(self, entity_id: str, parent_id: str, location: str) -> None:
+        """Move a labware entity atomically between scene-graph parents."""
+        with self._lock:
+            self._state["attachments"][entity_id] = parent_id
+            entity = self._state["entities"].setdefault(entity_id, {"entity_type": "labware"})
+            entity.update({"parent_id": parent_id, "location": location})
+
     def _emit(
         self,
         *,
@@ -100,9 +169,37 @@ class SimulatedHardware:
         message: str,
         status: str = "running",
         progress: float | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             self._sequence += 1
+            event_metadata = copy.deepcopy(metadata or {})
+            motion = event_metadata.get("motion") or self._state.get("transport") or {}
+            entity_id = str(
+                motion.get("labware_id")
+                or ("target_flask" if action in {"dispense_medium", "transfer_seed", "mix_and_seal", "configure"} else "measurement_plate" if "plate" in action else device)
+            )
+            attachment_transition = event_metadata.get("attachment_transition")
+            command = event_metadata.get("motion_command") or build_motion_command(
+                sequence=self._sequence,
+                actor_id=device,
+                entity_id=entity_id,
+                action_type=action,
+                message=message,
+                simulation_start_ms=self._simulation_time_ms,
+                source_location=motion.get("source_location"),
+                target_location=motion.get("target_location"),
+                attachment_transition=attachment_transition,
+                status=status,
+                progress=progress,
+            )
+            self._simulation_time_ms += int(command.get("nominal_duration_ms") or 0)
+            self._state["simulation_time_ms"] = self._simulation_time_ms
+            self._state["motion_schema_version"] = MOTION_SCHEMA_VERSION
+            self._state["active_commands"] = [copy.deepcopy(command)]
+            self._state["resource_occupancy"] = {
+                resource: command["command_id"] for resource in command.get("required_resources", [])
+            }
             event = {
                 "sequence": self._sequence,
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -111,8 +208,11 @@ class SimulatedHardware:
                 "message": message,
                 "status": status,
                 "progress": progress,
+                "motion_command": copy.deepcopy(command),
                 "snapshot": copy.deepcopy(self._state),
             }
+            if event_metadata:
+                event.update(event_metadata)
             self._events.append(event)
         if self.event_sink:
             self.event_sink(copy.deepcopy(event))
@@ -130,6 +230,8 @@ class SimulatedHardware:
     ) -> HardwareResult:
         with self._lock:
             events = copy.deepcopy(self._events[start_index:])
+            self._state["active_commands"] = []
+            self._state["resource_occupancy"] = {}
         return HardwareResult(
             ok=ok,
             device=device,
@@ -173,37 +275,198 @@ class SimulatedHardware:
         task_id: str,
         location: str,
         container: str,
+        carrier: str = "human_operator",
     ) -> HardwareResult:
         start = len(self._events)
+        carrier_state = self._state.get(carrier) if carrier in {"robot_arm", "mobile_robot"} else None
+        carrier_parent = (
+            "robot_arm.gripper"
+            if carrier == "robot_arm"
+            else "mobile_robot.tray"
+            if carrier == "mobile_robot"
+            else "manual_operator.handoff_tray"
+        )
+        destination_parent = f"{location}.slot"
         with self._lock:
-            self._state["phase"] = "MANUAL_TRANSFER"
-            self._state["sample"].update(
-                {"location": "in_transit", "container": container}
+            source_location = (
+                self._state["measurement_plate"]["location"]
+                if container == "measurement_plate"
+                else self._state["sample"]["location"]
             )
+            self._state["phase"] = "MANUAL_TRANSFER"
+            self._state["transport"] = {
+                "carrier": carrier,
+                "labware_id": container,
+                "source_location": source_location,
+                "target_location": location,
+                "motion_phase": "PICKING",
+                "progress": 0.15,
+            }
+            if carrier_state is not None:
+                carrier_state.update({"status": "RUNNING", "pose": "PICK", "gripper_state": "OPEN"})
         self._emit(
-            device="human_operator",
-            action=task_id,
-            message=f"Moving {container} to {location}",
-            progress=0.5,
+            device=carrier,
+            action="pick_labware",
+            message=f"Picking {container} at {source_location}",
+            progress=0.15,
+            metadata={
+                "task_id": task_id,
+                "motion": copy.deepcopy(self._state["transport"]),
+                "attachment_transition": {
+                    "entity_id": container,
+                    "phase": "grip_verify",
+                    "from_parent": self._state["attachments"].get(container),
+                    "to_parent": carrier_parent,
+                },
+            },
         )
         self._pause()
         with self._lock:
-            self._state["sample"]["location"] = location
+            self._state["transport"].update({"motion_phase": "TRANSPORTING", "progress": 0.6})
+            if carrier_state is not None:
+                carrier_state.update({"pose": "CARRY", "gripper_state": "CLOSED"})
+        self._set_attachment(container, carrier_parent, "in_transit")
+        with self._lock:
+            if container == "measurement_plate":
+                self._state["measurement_plate"]["location"] = "in_transit"
+            else:
+                self._state["sample"].update({"location": "in_transit", "container": container})
+        self._emit(
+            device=carrier,
+            action="transport_labware",
+            message=f"Transporting {container} to {location}",
+            progress=0.6,
+            metadata={"task_id": task_id, "motion": copy.deepcopy(self._state["transport"])},
+        )
+        self._pause()
+        with self._lock:
+            self._state["transport"].update({"motion_phase": "PLACING", "progress": 0.9})
+            if carrier_state is not None:
+                carrier_state.update({"pose": "PLACE", "gripper_state": "CLOSED"})
+        self._emit(
+            device=carrier,
+            action="place_labware",
+            message=f"Positioning {container} at {location}",
+            progress=0.9,
+            metadata={
+                "task_id": task_id,
+                "motion": copy.deepcopy(self._state["transport"]),
+                "attachment_transition": {
+                    "entity_id": container,
+                    "phase": "release",
+                    "from_parent": carrier_parent,
+                    "to_parent": destination_parent,
+                },
+            },
+        )
+        self._pause()
+        self._set_attachment(container, destination_parent, location)
+        with self._lock:
+            if container == "measurement_plate":
+                self._state["measurement_plate"]["location"] = location
+            else:
+                self._state["sample"]["location"] = location
             if location == "liquid_handler":
                 self._state["liquid_handler"]["deck_loaded"] = True
+                if task_id == "load_liquid_handler":
+                    self._state["measurement_plate"]["location"] = "liquid_handler"
+                    self._set_attachment("measurement_plate", "liquid_handler.plate_slot", "liquid_handler")
+            self._state["transport"].update({"motion_phase": "COMPLETED", "progress": 1.0})
+            if carrier_state is not None:
+                carrier_state.update({"status": "READY", "pose": "HOME", "gripper_state": "OPEN"})
+                if carrier == "mobile_robot":
+                    carrier_state["location"] = location
         self._emit(
-            device="human_operator",
+            device=carrier,
+            action="place_labware",
+            message=f"{container} placed and verified at {location}",
+            status="completed",
+            progress=1.0,
+            metadata={"task_id": task_id, "motion": copy.deepcopy(self._state["transport"])},
+        )
+        self._emit(
+            device=carrier,
             action=task_id,
-            message=f"{container} placed at {location}",
+            message=f"Transfer completed: {container} at {location}",
+            status="completed",
+            progress=1.0,
+            metadata={"task_id": task_id, "motion": copy.deepcopy(self._state["transport"])},
+        )
+        return self._result(
+            start,
+            ok=True,
+            device=carrier,
+            action=task_id,
+            message="Labware transfer completed",
+        )
+
+    def prepare_measurement_plate(
+        self,
+        *,
+        sample_volume_ml: float,
+        blank_volume_ml: float,
+    ) -> HardwareResult:
+        start = len(self._events)
+        with self._lock:
+            source_volume = float(self._state["source_reactor"]["volume_ml"])
+            medium_volume = float(self._state["media_reservoir"]["volume_ml"])
+            plate_location = self._state["measurement_plate"]["location"]
+        if source_volume < sample_volume_ml or medium_volume < blank_volume_ml:
+            return self._fail(
+                start,
+                device="liquid_handler",
+                action="prepare_measurement_plate",
+                message="Insufficient liquid for the measurement plate",
+                error_code="MEASUREMENT_PLATE_VOLUME_LIMIT",
+            )
+        if plate_location != "liquid_handler":
+            return self._fail(
+                start,
+                device="liquid_handler",
+                action="prepare_measurement_plate",
+                message="Measurement plate is not loaded on the liquid handler",
+                error_code="MEASUREMENT_PLATE_NOT_LOADED",
+            )
+        with self._lock:
+            self._state["phase"] = "PREPARING_MEASUREMENT_PLATE"
+            self._state["liquid_handler"].update({"status": "RUNNING", "progress": 0.25})
+        self._emit(
+            device="liquid_handler",
+            action="prepare_measurement_plate",
+            message="Aspirating culture sample for well A1",
+            progress=0.25,
+        )
+        self._pause()
+        with self._lock:
+            self._state["source_reactor"]["volume_ml"] -= sample_volume_ml
+            self._state["measurement_plate"]["sample_volume_ml"] = sample_volume_ml
+            self._state["liquid_handler"]["progress"] = 0.6
+        self._emit(
+            device="liquid_handler",
+            action="prepare_measurement_plate",
+            message="Dispensing culture sample into well A1",
+            progress=0.6,
+        )
+        self._pause()
+        with self._lock:
+            self._state["media_reservoir"]["volume_ml"] -= blank_volume_ml
+            self._state["measurement_plate"].update(
+                {"blank_volume_ml": blank_volume_ml, "status": "PREPARED"}
+            )
+            self._state["liquid_handler"].update({"status": "READY", "progress": 1.0})
+        self._emit(
+            device="liquid_handler",
+            action="prepare_measurement_plate",
+            message="Measurement plate prepared: sample A1 / blank A2",
             status="completed",
             progress=1.0,
         )
         return self._result(
             start,
             ok=True,
-            device="human_operator",
-            action=task_id,
-            message="Manual transfer completed",
+            device="liquid_handler",
+            action="prepare_measurement_plate",
+            message="Measurement plate prepared",
         )
 
     def blank_spectrophotometer(self, wavelength_nm: float) -> HardwareResult:
@@ -211,16 +474,16 @@ class SimulatedHardware:
         if "spectrophotometer_timeout" in self.faults:
             return self._fail(
                 start,
-                device="spectrophotometer",
-                action="blank",
-                message="Spectrophotometer did not respond during blank calibration",
+                device="plate_reader",
+                action="blank_plate",
+                message="Plate reader did not respond during blank calibration",
                 error_code="SPECTROPHOTOMETER_TIMEOUT",
             )
         if "blank_calibration_failure" in self.faults:
             return self._fail(
                 start,
-                device="spectrophotometer",
-                action="blank",
+                device="plate_reader",
+                action="blank_plate",
                 message="Blank calibration was rejected",
                 error_code="BLANK_CALIBRATION_FAILED",
             )
@@ -233,20 +496,52 @@ class SimulatedHardware:
                     "blanked": False,
                 }
             )
+            self._state["plate_reader"].update(
+                {
+                    "status": "LOADING",
+                    "door_state": "OPEN",
+                    "tray_state": "EXTENDED",
+                    "wavelength_nm": float(wavelength_nm),
+                    "blanked": False,
+                }
+            )
+            self._state["device_interlocks"].update(
+                {"plate_reader_door": "OPEN", "plate_reader_tray": "EXTENDED"}
+            )
         self._emit(
-            device="spectrophotometer",
-            action="blank",
-            message=f"Blanking at {wavelength_nm:.0f} nm",
-            progress=0.5,
+            device="plate_reader",
+            action="open_door",
+            message="Opening plate reader and accepting the measurement plate",
+            progress=0.15,
+            metadata={"step": "BlankSpectrophotometer"},
+        )
+        self._pause()
+        with self._lock:
+            self._state["plate_reader"].update(
+                {"status": "RUNNING", "door_state": "CLOSED", "tray_state": "LOADED"}
+            )
+            self._state["device_interlocks"].update(
+                {"plate_reader_door": "CLOSED", "plate_reader_tray": "LOADED"}
+            )
+            self._state["measurement_plate"]["status"] = "READING_BLANK"
+        self._emit(
+            device="plate_reader",
+            action="blank_plate",
+            message=f"Blanking plate well A2 at {wavelength_nm:.0f} nm",
+            progress=0.55,
         )
         self._pause()
         with self._lock:
             self._state["spectrophotometer"].update(
                 {"status": "READY", "blanked": True}
             )
+            self._state["plate_reader"].update(
+                {"status": "READY", "blanked": True, "door_state": "CLOSED"}
+            )
+            self._state["measurement_plate"]["status"] = "BLANKED"
         self._emit(
-            device="spectrophotometer",
-            action="blank",
+            device="plate_reader",
+            action="blank_plate",
             message="Blank calibration completed",
             status="completed",
             progress=1.0,
@@ -254,8 +549,8 @@ class SimulatedHardware:
         return self._result(
             start,
             ok=True,
-            device="spectrophotometer",
-            action="blank",
+            device="plate_reader",
+            action="blank_plate",
             message="Blank calibration completed",
         )
 
@@ -267,30 +562,32 @@ class SimulatedHardware:
     ) -> HardwareResult:
         start = len(self._events)
         with self._lock:
-            blanked = bool(self._state["spectrophotometer"]["blanked"])
+            blanked = bool(self._state["plate_reader"]["blanked"])
         if not blanked:
             return self._fail(
                 start,
-                device="spectrophotometer",
-                action="measure_absorbance",
+                device="plate_reader",
+                action="measure_plate_absorbance",
                 message="Absorbance measurement requires a valid blank",
                 error_code="SPECTROPHOTOMETER_NOT_BLANKED",
             )
         if "invalid_absorbance" in self.faults:
             return self._fail(
                 start,
-                device="spectrophotometer",
-                action="measure_absorbance",
+                device="plate_reader",
+                action="measure_plate_absorbance",
                 message="Spectrophotometer returned an invalid absorbance value",
                 error_code="INVALID_ABSORBANCE",
             )
         with self._lock:
             self._state["phase"] = "MEASURING_OD"
             self._state["spectrophotometer"]["status"] = "RUNNING"
+            self._state["plate_reader"].update({"status": "RUNNING", "tray_state": "LOADED"})
+            self._state["measurement_plate"]["status"] = "READING_SAMPLE"
         self._emit(
-            device="spectrophotometer",
-            action="measure_absorbance",
-            message=f"Measuring absorbance at {wavelength_nm:.0f} nm",
+            device="plate_reader",
+            action="measure_plate_absorbance",
+            message=f"Measuring plate well A1 at {wavelength_nm:.0f} nm",
             progress=0.5,
         )
         self._pause()
@@ -302,9 +599,20 @@ class SimulatedHardware:
                     "absorbance": float(expected_absorbance),
                 }
             )
+            self._state["plate_reader"].update(
+                {
+                    "status": "COMPLETED",
+                    "wavelength_nm": float(wavelength_nm),
+                    "absorbance": float(expected_absorbance),
+                    "tray_state": "LOADED",
+                }
+            )
+            self._state["measurement_plate"].update(
+                {"status": "MEASURED", "absorbance": float(expected_absorbance)}
+            )
         self._emit(
-            device="spectrophotometer",
-            action="measure_absorbance",
+            device="plate_reader",
+            action="measure_plate_absorbance",
             message=f"Absorbance measured: {expected_absorbance:.3f}",
             status="completed",
             progress=1.0,
@@ -312,8 +620,8 @@ class SimulatedHardware:
         return self._result(
             start,
             ok=True,
-            device="spectrophotometer",
-            action="measure_absorbance",
+            device="plate_reader",
+            action="measure_plate_absorbance",
             message=f"OD result recorded: {expected_absorbance:.3f}",
         )
 
@@ -411,14 +719,6 @@ class SimulatedHardware:
             reservoir = float(self._state["media_reservoir"]["volume_ml"])
             target_volume = float(self._state["target_reactor"]["volume_ml"])
             capacity = float(self._state["target_reactor"]["capacity_ml"])
-        if "pump_a_blocked" in self.faults:
-            return self._fail(
-                start,
-                device="media_pump",
-                action="dispense_medium",
-                message="Media pump is blocked",
-                error_code="MEDIA_PUMP_BLOCKED",
-            )
         if reservoir < volume_ml or target_volume + volume_ml > capacity:
             return self._fail(
                 start,
@@ -432,6 +732,7 @@ class SimulatedHardware:
             self._state["target_reactor"]["id"] = target
             self._state["media_pump"]["status"] = "RUNNING"
             self._state["liquid_handler"]["status"] = "RUNNING"
+            self._state["device_interlocks"]["media_valve"] = "OPEN"
         increments = 10
         for index in range(1, increments + 1):
             moved = volume_ml / increments
@@ -446,10 +747,23 @@ class SimulatedHardware:
                 progress=index / increments,
             )
             self._pause()
+            if "pump_a_blocked" in self.faults and index == 3:
+                with self._lock:
+                    self._state["media_pump"]["status"] = "DECELERATING"
+                    self._state["liquid_handler"]["status"] = "FAULT"
+                    self._state["device_interlocks"]["media_valve"] = "CLOSED"
+                return self._fail(
+                    start,
+                    device="media_pump",
+                    action="dispense_medium",
+                    message=f"Media pump blocked after {self._state['target_reactor']['volume_ml']:.1f} mL was delivered",
+                    error_code="MEDIA_PUMP_BLOCKED",
+                )
             if "aspirate_dispense_failure" in self.faults and index == 4:
                 with self._lock:
                     self._state["media_pump"]["status"] = "OFF"
                     self._state["liquid_handler"]["status"] = "FAULT"
+                    self._state["device_interlocks"]["media_valve"] = "CLOSED"
                 return self._fail(
                     start,
                     device="liquid_handler",
@@ -459,6 +773,7 @@ class SimulatedHardware:
                 )
         with self._lock:
             self._state["media_pump"]["status"] = "OFF"
+            self._state["device_interlocks"]["media_valve"] = "CLOSED"
             self._state["liquid_handler"].update(
                 {"status": "READY", "progress": 1.0}
             )
@@ -632,6 +947,8 @@ class SimulatedHardware:
             self._state["sample"].update(
                 {"location": "incubator", "container": "target_flask"}
             )
+            self._state["device_interlocks"]["incubator_door"] = "CLOSED"
+            self._set_attachment("target_flask", "incubator.slot_1", "incubator")
         self._emit(
             device="incubator",
             action="configure",
@@ -657,6 +974,16 @@ class SimulatedHardware:
             self._state["seed_pump"]["status"] = "OFF"
             self._state["liquid_handler"]["status"] = "STANDBY"
             self._state["spectrophotometer"]["status"] = "STANDBY"
+            self._state["plate_reader"].update(
+                {"status": "STANDBY", "door_state": "CLOSED", "tray_state": "HOME"}
+            )
+            self._state["robot_arm"].update(
+                {"status": "STANDBY", "pose": "HOME", "gripper_state": "OPEN"}
+            )
+            self._state["mobile_robot"].update(
+                {"status": "STANDBY", "location": "home", "pose": "HOME", "gripper_state": "OPEN"}
+            )
+            self._state["transport"].update({"motion_phase": "COMPLETED", "progress": 1.0})
         self._emit(
             device="workcell",
             action="cleanup",
@@ -682,8 +1009,56 @@ class SimulatedHardware:
             self._state["seed_pump"]["status"] = "OFF"
             self._state["liquid_handler"]["status"] = "SAFE"
             self._state["spectrophotometer"]["status"] = "SAFE"
+            self._state["plate_reader"].update(
+                {"status": "SAFE", "door_state": "CLOSED", "tray_state": "HOME"}
+            )
+            self._state["robot_arm"].update(
+                {"status": "DECELERATING", "pose": "SAFE_STOP"}
+            )
+            self._state["mobile_robot"].update(
+                {"status": "DECELERATING", "pose": "SAFE_STOP"}
+            )
+            self._state["transport"].update({"motion_phase": "CONTROLLED_STOP"})
+            self._state["device_interlocks"].update(
+                {
+                    "plate_reader_door": "CLOSED",
+                    "plate_reader_tray": "HOME",
+                    "media_valve": "CLOSED",
+                }
+            )
             if self._state["incubator"]["status"] != "RUNNING":
                 self._state["incubator"]["status"] = "STANDBY"
+        self._emit(
+            device="safety_controller",
+            action="safe_shutdown",
+            message=f"Controlled stop started: {reason}",
+            progress=0.35,
+            metadata={"step": "SafeShutdown"},
+        )
+        self._pause()
+        with self._lock:
+            arm_holds_labware = any(
+                parent == "robot_arm.gripper" for parent in self._state["attachments"].values()
+            )
+            self._state["robot_arm"].update(
+                {
+                    "status": "SAFE_HOLD" if arm_holds_labware else "SAFE",
+                    "pose": "HOLD" if arm_holds_labware else "HOME",
+                    "gripper_state": "CLOSED" if arm_holds_labware else "OPEN",
+                }
+            )
+            self._state["mobile_robot"].update(
+                {"status": "SAFE", "pose": "HOME", "gripper_state": "OPEN"}
+            )
+            self._state["transport"].update({"motion_phase": "CANCELLED"})
+        self._emit(
+            device="robot_arm",
+            action="return_home",
+            message="Robot retracted vertically and reached its safe pose",
+            status="completed",
+            progress=0.82,
+            metadata={"step": "SafeShutdown"},
+        )
         self._emit(
             device="safety_controller",
             action="safe_shutdown",

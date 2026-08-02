@@ -16,9 +16,11 @@ from app.agent.nodes import (
     manual_move_to_incubator_node,
     measure_absorbance_node,
     move_to_incubator_node,
+    prepare_measurement_plate_node,
     record_experiment_node,
     safe_shutdown_node,
     seal_culture_bottle_node,
+    store_measurement_plate_node,
     transfer_seed_culture_node,
 )
 from app.agent.state import AlgaeSubcultureState
@@ -31,7 +33,7 @@ def _route_after_schedule(state: AlgaeSubcultureState) -> str:
         return END
     if status == "FAILED":
         return "SafeShutdown"
-    return "ManualLoadSpectrophotometer"
+    return "ManualLoadLiquidHandler"
 
 
 def _next_or_shutdown(next_node: str):
@@ -62,12 +64,20 @@ def build_subculture_workflow(
         partial(manual_load_spectrophotometer_node, controller=hardware),
     )
     workflow.add_node(
+        "PrepareMeasurementPlate",
+        partial(prepare_measurement_plate_node, controller=hardware),
+    )
+    workflow.add_node(
         "BlankSpectrophotometer",
         partial(blank_spectrophotometer_node, controller=hardware),
     )
     workflow.add_node(
         "MeasureAbsorbance",
         partial(measure_absorbance_node, controller=hardware),
+    )
+    workflow.add_node(
+        "StoreMeasurementPlate",
+        partial(store_measurement_plate_node, controller=hardware),
     )
     workflow.add_node(
         "ManualLoadLiquidHandler",
@@ -110,6 +120,14 @@ def build_subculture_workflow(
     workflow.add_edge(START, "CheckSchedule")
     workflow.add_conditional_edges("CheckSchedule", _route_after_schedule)
     workflow.add_conditional_edges(
+        "ManualLoadLiquidHandler",
+        _next_or_shutdown("PrepareMeasurementPlate"),
+    )
+    workflow.add_conditional_edges(
+        "PrepareMeasurementPlate",
+        _next_or_shutdown("ManualLoadSpectrophotometer"),
+    )
+    workflow.add_conditional_edges(
         "ManualLoadSpectrophotometer",
         _next_or_shutdown("BlankSpectrophotometer"),
     )
@@ -119,10 +137,10 @@ def build_subculture_workflow(
     )
     workflow.add_conditional_edges(
         "MeasureAbsorbance",
-        _next_or_shutdown("ManualLoadLiquidHandler"),
+        _next_or_shutdown("StoreMeasurementPlate"),
     )
     workflow.add_conditional_edges(
-        "ManualLoadLiquidHandler",
+        "StoreMeasurementPlate",
         _next_or_shutdown("LoadMaterials"),
     )
     workflow.add_conditional_edges(

@@ -33,6 +33,17 @@ class SimulatedLiquidHandler:
     def check_materials(self, expected_media_ml: float) -> HardwareResult:
         return self._workcell.check_materials(expected_media_ml)
 
+    def prepare_measurement_plate(
+        self,
+        *,
+        sample_volume_ml: float,
+        blank_volume_ml: float,
+    ) -> HardwareResult:
+        return self._workcell.prepare_measurement_plate(
+            sample_volume_ml=sample_volume_ml,
+            blank_volume_ml=blank_volume_ml,
+        )
+
     def dispense_medium(self, target: str, volume_ml: float) -> HardwareResult:
         return self._workcell.dispense_medium(target, volume_ml)
 

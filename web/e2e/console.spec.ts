@@ -1,5 +1,26 @@
 import { expect, test } from '@playwright/test'
 
+async function startTestLabSimulation(page: import('@playwright/test').Page, scenarioName: string) {
+  await page.goto('/app/test-lab')
+  const card = page.getByRole('heading', { name: scenarioName }).locator('..')
+  await card.getByRole('button', { name: '启动并观看动画' }).click()
+  await expect(page).toHaveURL(/\/app\/runs\/simulation%3A[^/]+\/simulation$/)
+  await expect(page.getByRole('heading', { name: '传代可视化仿真' })).toBeVisible()
+}
+
+async function deleteCurrentTestWorkspace(page: import('@playwright/test').Page, request: import('@playwright/test').APIRequestContext) {
+  const match = page.url().match(/\/runs\/([^/]+)\/simulation$/)
+  if (!match) return
+  const runId = decodeURIComponent(match[1])
+  const detailResponse = await request.get(`/api/v2/runs/${encodeURIComponent(runId)}`)
+  if (!detailResponse.ok()) return
+  const detail = await detailResponse.json()
+  const workspaceId = detail.run?.workspace_id
+  if (workspaceId?.startsWith('test-')) {
+    await request.delete(`/api/v2/test-workspaces/${workspaceId}`, { headers: { 'X-CSRF-Token': 'test-csrf' } })
+  }
+}
+
 test('普通导航、调试模式和旧路由兼容', async ({ page }, testInfo) => {
   await page.goto('/app')
   await expect(page.getByRole('heading', { name: '实验室运行总览' })).toBeVisible()
@@ -82,6 +103,57 @@ test('正式传代审批结果可在 3D 页面实时播放', async ({ page, requ
   await testInfo.attach(`simulation-${testInfo.project.name}`, {
     body: await page.screenshot({ fullPage: true, path: screenshotPath }),
     contentType: 'image/png',
+  })
+})
+
+test.describe('Test Lab 传代动画入口', () => {
+  test.describe.configure({ timeout: 90_000 })
+  test.beforeEach(async ({}, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-1280', 'Test Lab 动画流程在桌面项目覆盖一次')
+  })
+
+  test('正常场景自动进入动画并播放完成', async ({ page, request }) => {
+    try {
+      await startTestLabSimulation(page, '传代仿真 · 正常')
+      await expect(page.getByTestId('simulation-3d-scene')).toBeVisible()
+      await expect(page.getByTestId('simulation-device-liquid_handler')).toBeVisible()
+      await expect(page.getByTestId('simulation-device-plate_reader')).toBeVisible()
+      await expect(page.getByTestId('simulation-device-mobile_robot')).toBeVisible()
+      await page.getByRole('button', { name: '追赶实时位置' }).click()
+      await expect(page.getByText('仿真已完成，但不代表真实传代已经发生。')).toBeVisible({ timeout: 30_000 })
+      await expect(page.getByText('151.0 mL')).toBeVisible()
+      await expect(page.getByText('198.8 mL')).toBeVisible()
+      await expect(page.getByText('849.8 mL')).toBeVisible()
+      await page.getByTestId('simulation-device-plate_reader').click()
+      await expect(page.getByTestId('simulation-device-inspector')).toContainText('96 孔板空白校准与 680 nm 吸光读取')
+    } finally {
+      await deleteCurrentTestWorkspace(page, request)
+    }
+  })
+
+  test('泵故障场景自动进入动画并显示安全停机', async ({ page, request }) => {
+    try {
+      await startTestLabSimulation(page, '传代仿真 · 泵故障')
+      await page.getByRole('button', { name: '追赶实时位置' }).click()
+      await expect(page.getByText('检测到设备故障，系统正在执行安全停机；品系数据不会修改。')).toBeVisible({ timeout: 30_000 })
+    } finally {
+      await deleteCurrentTestWorkspace(page, request)
+    }
+  })
+
+  test('人工边界场景在动画页逐步确认后完成', async ({ page, request }) => {
+    try {
+      await startTestLabSimulation(page, '传代仿真 · 人工边界')
+      for (let index = 0; index < 3; index += 1) {
+        const panel = page.getByTestId('simulation-manual-action')
+        await expect(panel).toBeVisible({ timeout: 20_000 })
+        await panel.getByRole('button', { name: '已完成人工操作' }).click()
+      }
+      await page.getByRole('button', { name: '追赶实时位置' }).click()
+      await expect(page.getByText('仿真已完成，但不代表真实传代已经发生。')).toBeVisible({ timeout: 30_000 })
+    } finally {
+      await deleteCurrentTestWorkspace(page, request)
+    }
   })
 })
 

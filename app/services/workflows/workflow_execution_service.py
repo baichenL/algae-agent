@@ -37,10 +37,12 @@ async def _run_subculture_workflow(
 
 _SIMULATION_STEPS = [
     "CheckSchedule",
+    "ManualLoadLiquidHandler",
+    "PrepareMeasurementPlate",
     "ManualLoadSpectrophotometer",
     "BlankSpectrophotometer",
     "MeasureAbsorbance",
-    "ManualLoadLiquidHandler",
+    "StoreMeasurementPlate",
     "LoadMaterials",
     "DispenseMedium",
     "TransferSeedCulture",
@@ -54,8 +56,12 @@ _SIMULATION_STEPS = [
 _ACTION_TO_STEP = {
     "load_spectrophotometer": "ManualLoadSpectrophotometer",
     "blank": "BlankSpectrophotometer",
+    "blank_plate": "BlankSpectrophotometer",
     "measure_absorbance": "MeasureAbsorbance",
+    "measure_plate_absorbance": "MeasureAbsorbance",
     "load_liquid_handler": "ManualLoadLiquidHandler",
+    "prepare_measurement_plate": "PrepareMeasurementPlate",
+    "store_measurement_plate": "StoreMeasurementPlate",
     "check": "LoadMaterials",
     "dispense_medium": "DispenseMedium",
     "transfer_seed": "TransferSeedCulture",
@@ -319,7 +325,11 @@ async def execute_workflow_run(run_id: int) -> dict:
     def persist_simulation_event(hardware_event: dict[str, Any]) -> None:
         with sink_lock:
             action = str(hardware_event.get("action") or "")
-            step = _ACTION_TO_STEP.get(action, action or "Simulation")
+            step_key = str(hardware_event.get("task_id") or action)
+            step = _ACTION_TO_STEP.get(
+                step_key,
+                str(hardware_event.get("step") or action or "Simulation"),
+            )
             status = str(hardware_event.get("status") or "running")
             step_progress = hardware_event.get("progress")
             overall_progress = _simulation_progress(step, step_progress)
@@ -327,6 +337,9 @@ async def execute_workflow_run(run_id: int) -> dict:
                 "step": step,
                 "device": hardware_event.get("device"),
                 "action": action,
+                "task_id": hardware_event.get("task_id"),
+                "motion": hardware_event.get("motion"),
+                "motion_command": hardware_event.get("motion_command"),
                 "status": status,
                 "step_progress": step_progress,
                 "progress": overall_progress,

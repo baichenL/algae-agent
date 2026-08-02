@@ -14,8 +14,12 @@ from app.core.workspaces import current_workspace, list_test_workspaces, workspa
 _ACTION_TO_SIMULATION_STEP = {
     "load_spectrophotometer": "ManualLoadSpectrophotometer",
     "blank": "BlankSpectrophotometer",
+    "blank_plate": "BlankSpectrophotometer",
     "measure_absorbance": "MeasureAbsorbance",
+    "measure_plate_absorbance": "MeasureAbsorbance",
     "load_liquid_handler": "ManualLoadLiquidHandler",
+    "prepare_measurement_plate": "PrepareMeasurementPlate",
+    "store_measurement_plate": "StoreMeasurementPlate",
     "check": "LoadMaterials",
     "dispense_medium": "DispenseMedium",
     "transfer_seed": "TransferSeedCulture",
@@ -25,6 +29,38 @@ _ACTION_TO_SIMULATION_STEP = {
     "cleanup": "CleanupWorkspace",
     "safe_shutdown": "SafeShutdown",
 }
+
+_SIMULATION_STEP_ORDER = [
+    "CheckSchedule",
+    "ManualLoadLiquidHandler",
+    "PrepareMeasurementPlate",
+    "ManualLoadSpectrophotometer",
+    "BlankSpectrophotometer",
+    "MeasureAbsorbance",
+    "StoreMeasurementPlate",
+    "LoadMaterials",
+    "DispenseMedium",
+    "TransferSeedCulture",
+    "MixAndSeal",
+    "ManualMoveToIncubator",
+    "MoveToIncubator",
+    "RecordExperiment",
+    "CleanupWorkspace",
+]
+
+
+def _simulation_event_progress(step: str, step_progress: Any) -> float:
+    if step == "SafeShutdown":
+        return 1.0
+    try:
+        index = _SIMULATION_STEP_ORDER.index(step)
+    except ValueError:
+        return 0.0
+    try:
+        local_progress = max(0.0, min(float(step_progress), 1.0))
+    except (TypeError, ValueError):
+        local_progress = 0.0
+    return (index + local_progress) / len(_SIMULATION_STEP_ORDER)
 
 
 PHASES: dict[str, list[tuple[str, str]]] = {
@@ -215,6 +251,21 @@ def _simulation_summary(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _simulation_run_visible_in_current_workspace(run: dict[str, Any]) -> bool:
+    """Keep the process-local simulator aligned with workspace ownership.
+
+    SimulationRunStore is intentionally process-local, so switching the database
+    workspace does not scope its contents. Test Lab registers each canonical run
+    with its isolated workspace; unregistered runs belong to the shared workspace.
+    """
+    canonical_id = f"simulation:{run['run_id']}"
+    owner = workspace_for_run(canonical_id)
+    workspace = current_workspace()
+    if owner is None:
+        return workspace.id == "shared"
+    return owner.id == workspace.id
+
+
 def list_runs(*, kind: str | None = None, status: str | None = None, limit: int = 100, _include_workspaces: bool = True) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     if kind in {None, "scientific"}:
@@ -224,7 +275,11 @@ def list_runs(*, kind: str | None = None, status: str | None = None, limit: int 
     if kind in {None, "workflow"}:
         items.extend(_workflow_summary(item) for item in workflow_runs.list_workflow_runs(limit=limit))
     if kind in {None, "simulation"}:
-        items.extend(_simulation_summary(item) for item in simulation_runs.list(limit=limit))
+        items.extend(
+            _simulation_summary(item)
+            for item in simulation_runs.list(limit=limit)
+            if _simulation_run_visible_in_current_workspace(item)
+        )
     if status:
         items = [item for item in items if item["status"] == status]
     for item in items:
@@ -236,6 +291,7 @@ def list_runs(*, kind: str | None = None, status: str | None = None, limit: int 
             for item in workspace_items:
                 item["workspace_id"] = workspace.id
             items.extend(workspace_items)
+    items = list({str(item["id"]): item for item in items}.values())
     items.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
     return items[: max(1, min(int(limit or 100), 500))]
 
@@ -440,10 +496,23 @@ def get_run(canonical_id: str) -> dict[str, Any] | None:
         task = run.get("pending_manual_task")
         if task:
             action = {"id": "resolve_manual", "label": "完成人工任务", "kind": "manual_task", "task_id": task.get("task_id"), "required_role": "approver", "requires_confirmation": True}
+        events = run.get("events") or []
+        last_event = events[-1] if events else {}
         return {
             **summary, "phases": _phase_payload("simulation", summary["phase"], terminal=summary["status"] == "succeeded", blocked=summary["status"] == "failed"),
             "current_action": action, "available_actions": [action] if action else [], "artifacts": [], "approvals": [],
-            "executions": [run], "assertions": [], "replans": [], "raw": run,
+            "executions": [run], "assertions": [], "replans": [],
+            "simulation": {
+                "current_step": run.get("current_step"),
+                "progress": float(run.get("overall_progress") or 0),
+                "latest_snapshot": run.get("hardware_state") or {},
+                "event_count": len(events),
+                "replay_available": bool(events),
+                "last_event_at": last_event.get("timestamp") or run.get("updated_at"),
+                "queue_position": run.get("queue_position"),
+                "interaction_mode": run.get("interaction_mode"),
+            },
+            "raw": run,
         }
     return None
 
@@ -487,13 +556,13 @@ def get_events(canonical_id: str, *, after: int = 0) -> list[dict[str, Any]]:
         ) or []
         for index, item in enumerate(raw_events, 1):
             if index > after:
-                action = item.get("action") or item.get("event") or "workflow_event"
+                action = item.get("task_id") or item.get("action") or item.get("event") or "workflow_event"
                 step = _ACTION_TO_SIMULATION_STEP.get(action, item.get("step") or detail.get("phase"))
                 payload = {
                     **item,
                     "step": step,
                     "step_progress": item.get("progress"),
-                    "progress": min(index / max(len(raw_events), 1), 1.0),
+                    "progress": _simulation_event_progress(step, item.get("progress")),
                     "snapshot": item.get("snapshot") or item.get("hardware_state") or {},
                 }
                 events.append({"sequence": index, "event_type": "simulation_fault" if item.get("status") == "failed" or item.get("error") else "simulation_step_completed" if item.get("status") == "completed" else "simulation_snapshot", "phase": step, "level": "error" if item.get("error") or item.get("status") == "failed" else "info", "payload": payload, "created_at": item.get("timestamp")})

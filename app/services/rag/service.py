@@ -797,6 +797,11 @@ def _build_citation(source_id: int, chunk: dict) -> RagCitation:
     )
 
 
+def citation_from_retrieved_chunk(source_id: int, chunk: dict) -> RagCitation:
+    """Build a provenance-complete citation from a real retrieved index row."""
+    return _build_citation(source_id, chunk)
+
+
 def _build_evidence(source_id: int, chunk: dict, question: str = "") -> RagEvidence:
     if _is_manual_operation_query(question):
         quote_summary = _summarize_manual_operation_chunk(chunk)

@@ -1,4 +1,4 @@
-import type { Approval, OperationSummary, RunDetail, RunSummary, SessionInfo, SimulationEvent, UserMemory, UserMemoryCandidate, UserMemorySettings } from './types'
+import type { Approval, EvaluationReport, OperationSummary, RunDetail, RunSummary, SessionInfo, SimulationEvent, UserMemory, UserMemoryCandidate, UserMemorySettings } from './types'
 
 let csrfToken: string | undefined
 const executionKeys = new Map<string, string>()
@@ -36,6 +36,8 @@ export const api = {
   },
   logout: () => request('/api/v2/session', { method: 'DELETE' }),
   dashboard: () => request<any>('/api/v2/dashboard'),
+  latestEvaluation: () => request<EvaluationReport>('/api/v2/evaluations/latest'),
+  evaluation: (reportId: string) => request<EvaluationReport>(`/api/v2/evaluations/${encodeURIComponent(reportId)}`),
   assistantHistory: (sessionId = 'react-assistant') => request<{ messages: { role: 'user' | 'assistant'; content: string }[] }>(`/api/v2/assistant/history?session_id=${encodeURIComponent(sessionId)}`),
   conversations: (status = 'active') => request<any>(`/api/v2/assistant/conversations?status=${status}`),
   createConversation: (title?: string) => request<any>('/api/v2/assistant/conversations', { method: 'POST', body: JSON.stringify({ title }) }),

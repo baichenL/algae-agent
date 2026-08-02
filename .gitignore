@@ -48,6 +48,7 @@ LSTM/
 
 data/outputs/
 data/logs/
+data/eval_reports/eval-*
 
 # Keep raw data folder structure if needed
 

@@ -34,10 +34,12 @@ SUPPORTED_FAULTS = {
 
 STEP_ORDER = [
     "CheckSchedule",
+    "ManualLoadLiquidHandler",
+    "PrepareMeasurementPlate",
     "ManualLoadSpectrophotometer",
     "BlankSpectrophotometer",
     "MeasureAbsorbance",
-    "ManualLoadLiquidHandler",
+    "StoreMeasurementPlate",
     "LoadMaterials",
     "DispenseMedium",
     "TransferSeedCulture",
@@ -51,8 +53,12 @@ STEP_ORDER = [
 _STEP_BY_ACTION = {
     "load_spectrophotometer": "ManualLoadSpectrophotometer",
     "blank": "BlankSpectrophotometer",
+    "blank_plate": "BlankSpectrophotometer",
     "measure_absorbance": "MeasureAbsorbance",
+    "measure_plate_absorbance": "MeasureAbsorbance",
     "load_liquid_handler": "ManualLoadLiquidHandler",
+    "prepare_measurement_plate": "PrepareMeasurementPlate",
+    "store_measurement_plate": "StoreMeasurementPlate",
     "check": "LoadMaterials",
     "dispense_medium": "DispenseMedium",
     "transfer_seed": "TransferSeedCulture",
@@ -306,7 +312,8 @@ class SimulationRunStore:
             record["events"].append(event)
             record["hardware_state"] = event.get("snapshot") or record["hardware_state"]
             record["current_step"] = _STEP_BY_ACTION.get(
-                str(event.get("action")), record["current_step"]
+                str(event.get("task_id") or event.get("action")),
+                str(event.get("step") or record["current_step"]),
             )
             record["overall_progress"] = self._progress(record["current_step"])
             record["updated_at"] = _now()

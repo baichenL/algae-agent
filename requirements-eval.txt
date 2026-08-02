@@ -1,0 +1,2 @@
+# Optional online evaluation dependencies. Keep separate from production.
+ragas==0.4.3

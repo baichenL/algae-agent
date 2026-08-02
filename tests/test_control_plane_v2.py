@@ -94,6 +94,86 @@ def test_v2_session_dashboard_and_run_projection(isolated_sqlite_db):
         assert conn.execute("SELECT COUNT(*) FROM run_events WHERE run_id = ?", (canonical_id,)).fetchone()[0] == len(events)
 
 
+def test_simulation_projection_exposes_animation_state(isolated_sqlite_db, monkeypatch):
+    from app.services import control_plane
+
+    run = {
+        "run_id": "projection-run",
+        "status": "WAITING_MANUAL",
+        "strain_id": "Chlorella_01",
+        "overall_progress": 0.25,
+        "current_step": "ManualLoadSpectrophotometer",
+        "queue_position": 0,
+        "interaction_mode": "verification",
+        "hardware_state": {"sample": {"location": "manual_zone"}},
+        "pending_manual_task": {"task_id": "load_spectrophotometer"},
+        "events": [{"timestamp": "2026-08-01T12:00:00+00:00", "action": "load_spectrophotometer"}],
+    }
+
+    class Store:
+        @staticmethod
+        def get(run_id):
+            return run if run_id == "projection-run" else None
+
+    monkeypatch.setattr(control_plane, "simulation_runs", Store())
+    projected = control_plane.get_run("simulation:projection-run")
+
+    assert projected["kind"] == "simulation"
+    assert projected["current_action"]["id"] == "resolve_manual"
+    assert projected["simulation"] == {
+        "current_step": "ManualLoadSpectrophotometer",
+        "progress": 0.25,
+        "latest_snapshot": {"sample": {"location": "manual_zone"}},
+        "event_count": 1,
+        "replay_available": True,
+        "last_event_at": "2026-08-01T12:00:00+00:00",
+        "queue_position": 0,
+        "interaction_mode": "verification",
+    }
+
+
+def test_simulation_list_is_workspace_scoped_and_deduplicated(isolated_sqlite_db, monkeypatch):
+    from app.core.workspaces import WorkspaceContext, workspace_scope
+    from app.services import control_plane
+
+    shared_run = {"run_id": "shared-run", "status": "COMPLETED", "strain_id": "Shared", "overall_progress": 1.0}
+    test_run = {"run_id": "test-run", "status": "QUEUED", "strain_id": "Test", "overall_progress": 0.0}
+    test_workspace = WorkspaceContext(id="test-simulation", name="test", db_path=str(isolated_sqlite_db))
+
+    class Store:
+        @staticmethod
+        def list(limit=100):
+            return [shared_run, test_run]
+
+    monkeypatch.setattr(control_plane, "simulation_runs", Store())
+    monkeypatch.setattr(control_plane, "list_test_workspaces", lambda: [test_workspace])
+    monkeypatch.setattr(
+        control_plane,
+        "workspace_for_run",
+        lambda run_id: test_workspace if run_id == "simulation:test-run" else None,
+    )
+    monkeypatch.setattr(control_plane.control_plane_db, "upsert_run", lambda item: None)
+
+    shared_workspace = WorkspaceContext(id="shared", name="shared", db_path=str(isolated_sqlite_db))
+    with workspace_scope(shared_workspace):
+        runs = control_plane.list_runs(kind="simulation")
+
+    assert [item["id"] for item in runs].count("simulation:shared-run") == 1
+    assert [item["id"] for item in runs].count("simulation:test-run") == 1
+    assert {item["id"]: item["workspace_id"] for item in runs} == {
+        "simulation:shared-run": "shared",
+        "simulation:test-run": "test-simulation",
+    }
+
+
+def test_simulation_event_progress_uses_step_position():
+    from app.services.control_plane import _simulation_event_progress
+
+    assert _simulation_event_progress("DispenseMedium", 0.5) < 0.6
+    assert _simulation_event_progress("DispenseMedium", 0.5) > 0.4
+    assert _simulation_event_progress("SafeShutdown", 0.0) == 1.0
+
+
 def test_scientific_approval_auto_executes(isolated_sqlite_db):
     run = _seed_scientific_run()
     pending_id = run["proposal"]["pending_id"]
@@ -237,9 +317,11 @@ def test_manual_subculture_confirmation_updates_laboratory_fact_once(isolated_sq
     }
     assert completed_steps == {
         "CheckSchedule",
+        "PrepareMeasurementPlate",
         "ManualLoadSpectrophotometer",
         "BlankSpectrophotometer",
         "MeasureAbsorbance",
+        "StoreMeasurementPlate",
         "ManualLoadLiquidHandler",
         "LoadMaterials",
         "DispenseMedium",

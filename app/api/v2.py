@@ -45,6 +45,11 @@ from app.services.proposal_execution_validation import validate_pending_for_exec
 from app.services.trusted_execution_dispatch import dispatch_trusted_execution
 from app.services.scientific.demo_data import scientific_demo_file
 from app.services.scientific.importer import DatasetImportError, parse_scientific_dataset
+from app.services.evaluation.reporting import (
+    load_latest_report,
+    load_report,
+    sanitize_report,
+)
 from app.core.workspaces import (
     create_test_workspace,
     delete_test_workspace,
@@ -396,17 +401,17 @@ TEST_SCENARIOS = [
     },
     {
         "id": "subculture-happy", "name": "传代仿真 · 正常", "kind": "simulation",
-        "description": "完整设备步骤与人工任务自动确认。", "fault": None,
+        "description": "培养瓶传代、96 孔板检测与机器人搬运完整联动。", "fault": None,
         "assertions": ["simulation_only", "safe completion"],
     },
     {
         "id": "subculture-pump-fault", "name": "传代仿真 · 泵故障", "kind": "simulation",
-        "description": "注入 pump_a_blocked 并验证安全停机。", "fault": "pump_a_blocked",
+        "description": "孔板检测后注入培养基泵堵塞，并验证机器人安全回零。", "fault": "pump_a_blocked",
         "assertions": ["fault observed", "safe shutdown"],
     },
     {
         "id": "subculture-manual", "name": "传代仿真 · 人工边界", "kind": "simulation",
-        "description": "verification 模式停在人工任务并等待处理。", "fault": None,
+        "description": "在工作站装载、孔板交接和培养箱交接处等待人工确认。", "fault": None,
         "assertions": ["WAITING_MANUAL", "manual task resolvable"],
     },
 ]
@@ -461,6 +466,64 @@ async def logout(
 @router.get("/dashboard")
 async def dashboard_endpoint(_: ApiPrincipal = Depends(require_session_viewer)):
     return {"status": "success", **dashboard()}
+
+
+@router.get("/evaluations/latest")
+async def latest_evaluation_endpoint(
+    _: ApiPrincipal = Depends(require_session_viewer),
+):
+    report = load_latest_report()
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "evaluation_report_not_found", "message": "No completed evaluation report is available."},
+        )
+    return sanitize_report(report)
+
+
+@router.get("/evaluations/{report_id}")
+async def evaluation_report_endpoint(
+    report_id: str,
+    _: ApiPrincipal = Depends(require_session_viewer),
+):
+    try:
+        report = load_report(report_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_evaluation_report_id", "message": "Invalid evaluation report id."},
+        )
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "evaluation_report_not_found", "message": "Evaluation report was not found."},
+        )
+    return sanitize_report(report)
+
+
+@router.get("/evaluations/{report_id}/download")
+async def download_evaluation_report_endpoint(
+    report_id: str,
+    _: ApiPrincipal = Depends(require_session_viewer),
+):
+    try:
+        report = load_report(report_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_evaluation_report_id", "message": "Invalid evaluation report id."},
+        )
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "evaluation_report_not_found", "message": "Evaluation report was not found."},
+        )
+    body = json.dumps(sanitize_report(report), ensure_ascii=False, indent=2, allow_nan=False)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{report_id}.json"'},
+    )
 
 
 @router.get("/runs")

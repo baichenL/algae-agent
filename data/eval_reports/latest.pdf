@@ -1,0 +1,354 @@
+标准化评估中心
+
+2026-07-30T14:28:31.830896Z · commit f986b3955763d6c5dcd4eba7c9b17f64ed40af83
+数据集：{"agent": "agent-eval-v2", "tool": "interview-tool-v1", "rag": "interview-rag-v1", "scientific":
+"scientific-offline-v2", "memory": "user-memory-60-v1", "context": "context-8-scenarios-v1"}
+
+Agent 整体
+
+离线 deterministic harness；不代表在线模型能力。
+
+  COMPLETED                                   NOT_RUN
+
+Task Success Rate / Pass¹                   Provider Canary Pass³
+
+100.0% (95% CI 92.9–                        NOT RUN
+100.0%)
+                                            n = — · llm_judge
+n = 50 · deterministic                      每个任务在三次独立在线运行中全部成功的比
+成功完成一次完整任务轨迹的用例比例。                          例。
+
+τ-bench Pass¹                               默认 deterministic showcase 不调用真实
+                                            Provider；需单独 canary 配置与三次独立轨迹
+
+                                            τ-bench Pass^k
+
+  COMPLETED                                   COMPLETED
+
+Router Accuracy                             Router Macro Precision
+
+100.0% (95% CI 92.7–                        100.0% (95% CI 76.9–
+100.0%)                                     100.0%)
+
+n = 49 · deterministic                      n = 49 · deterministic
+按路由类别计算；Macro 指标对每个类别等权                     按路由类别计算；Macro 指标对每个类别等权
+平均。                                         平均。
+
+Standard multiclass classification metrics  Standard multiclass classification metrics
+  COMPLETED                                   COMPLETED
+
+Router Macro Recall                         Router Macro-F1
+
+100.0% (95% CI 76.9–                        100.0% (95% CI 76.9–
+100.0%)                                     100.0%)
+
+n = 49 · deterministic                      n = 49 · deterministic
+按路由类别计算；Macro 指标对每个类别等权                     按路由类别计算；Macro 指标对每个类别等权
+平均。                                         平均。
+
+Standard multiclass classification metrics  Standard multiclass classification metrics
+
+Tool Calling
+
+BFCL-compatible local evaluation；并非官方 BFCL leaderboard score。
+
+  COMPLETED                                   COMPLETED
+
+Tool Selection Accuracy                     AST Exact Match Accuracy
+
+100.0% (95% CI 79.6–                        100.0% (95% CI 79.6–
+100.0%)                                     100.0%)
+
+n = 15 · deterministic                      n = 15 · deterministic
+
+按本地固定 Tool Gold 的结构化期望与运行结果                 按本地固定 Tool Gold 的结构化期望与运行结果
+计算；不是 BFCL 官方榜单成绩。                          计算；不是 BFCL 官方榜单成绩。
+
+BFCL-compatible local evaluation            BFCL-compatible local evaluation
+  COMPLETED                         COMPLETED
+
+Executable Accuracy               Relevance Detection Accuracy
+
+100.0% (95% CI 43.9–              93.3% (95% CI 70.2–98.8%)
+100.0%)
+                                  n = 15 · deterministic
+n = 3 · deterministic             按本地固定 Tool Gold 的结构化期望与运行结果
+按本地固定 Tool Gold 的结构化期望与运行结果       计算；不是 BFCL 官方榜单成绩。
+计算；不是 BFCL 官方榜单成绩。
+                                  BFCL-compatible local evaluation
+BFCL-compatible local evaluation
+
+  COMPLETED                         COMPLETED
+
+Multi-turn State Accuracy         Multi-turn Response Accuracy
+
+100.0% (95% CI 43.9–              100.0% (95% CI 43.9–
+100.0%)                           100.0%)
+
+n = 3 · deterministic             n = 3 · deterministic
+
+按本地固定 Tool Gold 的结构化期望与运行结果       按本地固定 Tool Gold 的结构化期望与运行结果
+计算；不是 BFCL 官方榜单成绩。                计算；不是 BFCL 官方榜单成绩。
+
+BFCL-compatible local evaluation  BFCL-compatible local evaluation
+
+RAG Retrieval
+  NOT_RUN                       NOT_RUN
+
+Precision@5                   Recall@5
+
+NOT RUN                       NOT RUN
+
+n = — · deterministic         n = — · deterministic
+
+需要 50 条已人工审核且证据集合完整的          需要 50 条已人工审核且证据集合完整的
+interview-rag-v1。             interview-rag-v1。
+Gold 候选 50 条，其中人工审核 0/50；正式检  Gold 候选 50 条，其中人工审核 0/50；正式检
+索分数禁止生成                       索分数禁止生成
+
+BEIR retrieval metric         BEIR retrieval metric
+
+  NOT_RUN                       NOT_RUN
+
+Recall@20                     MRR@10
+
+NOT RUN                       NOT RUN
+
+n = — · deterministic         n = — · deterministic
+需要 50 条已人工审核且证据集合完整的          需要 50 条已人工审核且证据集合完整的
+interview-rag-v1。             interview-rag-v1。
+Gold 候选 50 条，其中人工审核 0/50；正式检  Gold 候选 50 条，其中人工审核 0/50；正式检
+索分数禁止生成                       索分数禁止生成
+
+BEIR retrieval metric         BEIR retrieval metric
+  NOT_RUN                       NOT_RUN
+
+nDCG@10                       Hit Rate@5
+
+NOT RUN                       NOT RUN
+
+n = — · deterministic         n = — · deterministic
+
+需要 50 条已人工审核且证据集合完整的          需要 50 条已人工审核且证据集合完整的
+interview-rag-v1。             interview-rag-v1。
+Gold 候选 50 条，其中人工审核 0/50；正式检  Gold 候选 50 条，其中人工审核 0/50；正式检
+索分数禁止生成                       索分数禁止生成
+
+BEIR retrieval metric         BEIR retrieval metric
+
+RAG Generation 与 Citation       NOT_RUN
+
+       NOT_RUN                Context Recall
+
+   Context Precision          NOT RUN
+
+  NOT RUN                     n = — · llm_judge
+                              参考答案所需事实被上下文覆盖的比例。
+   n = — · llm_judge          未启用 --judge
+   相关上下文在检索上下文中的精确度。          RAGAS
+   未启用 --judge
+   RAGAS
+
+  NOT_RUN                       NOT_RUN
+
+Faithfulness                  Answer Relevance
+
+NOT RUN                       NOT RUN
+
+n = — · llm_judge             n = — · llm_judge
+回答 claims 能由上下文支持的比例。         回答与问题意图的相关程度。
+未启用 --judge                   未启用 --judge
+RAGAS/ARES                    RAGAS
+  NOT_RUN                            NOT_RUN
+
+Citation Precision                 Citation Recall / Completeness
+
+NOT RUN                            NOT RUN
+
+n = — · llm_judge                  n = — · llm_judge
+引用能够支持其对应 claim 的比例。               需要引用的 claims 中得到引用支持的比例。
+未启用 --judge                        未启用 --judge
+ALCE                               ALCE
+
+  NOT_RUN
+
+Judge–Human Cohen’s κ
+
+NOT RUN
+
+n = — · llm_judge
+Judge 与人工标签扣除随机一致后的协议度。
+未启用 --judge
+Cohen’s kappa
+
+Scientific 闭环                        COMPLETED
+
+       COMPLETED                   Data Quality Recall
+
+   Data Quality Precision          100.0% (95% CI 56.6–
+                                   100.0%)
+  100.0% (95% CI 56.6–
+  100.0%)                          n = 5 · deterministic
+                                   按固定 seed 保留原始结果，并报告 bootstrap
+   n = 5 · deterministic           95% CI。
+   按固定 seed 保留原始结果，并报告 bootstrap
+   95% CI。                         Standard classification metric
+
+   Standard classification metric
+  COMPLETED                       COMPLETED
+
+Data Quality F1                 Growth Rate MAE
+
+100.0% (95% CI 100.0–           2.732e-17 (95% CI 2.342e-
+100.0%)                         17–3.123e-17)
+
+n = 8 · deterministic           n = 4 · deterministic
+
+按固定 seed 保留原始结果，并报告 bootstrap   按固定 seed 保留原始结果，并报告 bootstrap
+95% CI。                         95% CI。
+
+Standard classification metric  Standard regression metric
+
+  COMPLETED                       COMPLETED
+
+Growth Rate RMSE                Candidate Cause Hit@1
+
+2.761e-17 (95% CI 2.343e-       100.0% (95% CI 51.0–
+17–3.123e-17)                   100.0%)
+
+n = 4 · deterministic           n = 4 · deterministic
+
+按固定 seed 保留原始结果，并报告 bootstrap   按固定 seed 保留原始结果，并报告 bootstrap
+95% CI。                         95% CI。
+
+Standard regression metric      Standard ranking metric
+  COMPLETED                        COMPLETED
+
+Candidate Cause Hit@3            Candidate Cause MRR
+
+100.0% (95% CI 51.0–             100.0% (95% CI 100.0–
+100.0%)                          100.0%)
+
+n = 4 · deterministic            n = 4 · deterministic
+
+按固定 seed 保留原始结果，并报告 bootstrap    按固定 seed 保留原始结果，并报告 bootstrap
+95% CI。                          95% CI。
+
+Standard ranking metric          Standard ranking metric
+
+  COMPLETED                        COMPLETED
+
+Simple Regret                    Constraint Violation Rate
+
+0 (95% CI 0–0)                   0.0% (95% CI 0.0–79.3%)
+
+n = 5 · deterministic            n = 1 · deterministic
+按固定 seed 保留原始结果，并报告 bootstrap    按固定 seed 保留原始结果，并报告 bootstrap
+95% CI。                          95% CI。
+
+Constrained optimization metric  Constrained optimization metric
+
+  COMPLETED
+
+Task Success Rate
+
+100.0% (95% CI 20.7–
+100.0%)
+
+n = 1 · deterministic
+按固定 seed 保留原始结果，并报告 bootstrap
+95% CI。
+
+τ-bench task success
+User Memory                              NOT_RUN
+
+       NOT_RUN                         Extraction Precision
+
+   Extraction Exact Match              NOT RUN
+
+  NOT RUN                              n = — · llm_judge
+
+   n = — · llm_judge                   Provider suite 未启用
+                                       Standard extraction metric
+   Provider suite 未启用
+   Standard extraction metric
+
+  NOT_RUN                                NOT_RUN
+
+Extraction Recall                      Extraction F1
+
+NOT RUN                                NOT RUN
+
+n = — · llm_judge                      n = — · llm_judge
+
+Provider suite 未启用                     Provider suite 未启用
+Standard extraction metric             Standard extraction metric
+
+  COMPLETED                              COMPLETED
+
+Memory Recall@5                        Memory MRR@5
+
+70.0% (95% CI 40.0–100.0%)             29.0% (95% CI 12.7–48.7%)
+
+n = 10 · deterministic                 n = 10 · deterministic
+
+在隔离 owner/workspace 的临时 SQLite 中检      在隔离 owner/workspace 的临时 SQLite 中检
+索。                                     索。
+
+Standard information retrieval metric  Standard information retrieval metric
+  COMPLETED                            NOT_RUN
+
+Data Leakage Rate                    Proactive Safety Task Success Rate
+
+0.0% (95% CI 0.0–16.1%)              NOT RUN
+
+n = 20 · deterministic               n = — · deterministic
+其他 owner 能检索到目标 owner 记忆的比例；
+越低越好。                                必须运行实际主动服务链路；不能用 fixture 中
+                                     期望标签的数量作为代理分数。
+Cross-tenant isolation failure rate  fixture 已定义 20 条期望，但尚无逐条执行主动
+                                     服务链路的 deterministic harness
+
+                                     τ-bench-style task success
+
+Context 与效率                            COMPLETED
+
+效率指标不能单独证明任务质量提升。                    Compression Ratio
+
+       COMPLETED                     41.9% (95% CI 20.8–67.2%)
+
+   Input Tokens                      n = 8 · deterministic
+                                     full pipeline tokens / no-compression tokens；
+  2,160 (95% CI 1893–2454)           仅为效率指标。
+
+   n = 8 · deterministic             Compression ratio
+   Full pipeline 送入模型前的输入 token 估算。
+
+   Tokenizer input token count
+  COMPLETED                       COMPLETED
+
+P50 Latency                     P95 Latency
+
+20.7 ms (95% CI 19.81–          27.5 ms (95% CI 22–27.89)
+26.84)
+                                n = 8 · deterministic
+n = 8 · deterministic           Context assembly 墙钟耗时第 95 百分位。
+Context assembly 墙钟耗时中位数。
+                                Latency percentile
+Latency percentile
+
+Full closed loop vs no-replan   1
+                                0
+full_closed_loop
+no_replan                       0
+                                0.67
+Optimizer vs random selection
+                                2160
+optimizer                       1.001e+04
+random
+
+Full context vs no-compression
+
+full_pipeline
+no_compression
+

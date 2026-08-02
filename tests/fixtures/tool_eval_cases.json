@@ -1,0 +1,22 @@
+{
+  "dataset_id": "interview-tool-v1",
+  "version": "1.0.0",
+  "standard": "BFCL-compatible local evaluation",
+  "cases": [
+    {"id": "tool-01", "agent_case_id": "plain_chat_does_not_need_tool", "mode": "decision", "should_call": false},
+    {"id": "tool-02", "agent_case_id": "generation_query_uses_fact_layer", "mode": "decision", "should_call": true},
+    {"id": "tool-03", "agent_case_id": "pending_query_is_read_only", "mode": "decision", "should_call": true},
+    {"id": "tool-04", "agent_case_id": "tap_recipe_routes_to_rag", "mode": "decision", "should_call": true},
+    {"id": "tool-05", "agent_case_id": "incomplete_add_collects_pending_form", "mode": "decision", "should_call": true},
+    {"id": "tool-06", "agent_case_id": "update_strain_requires_approval", "mode": "decision", "should_call": true},
+    {"id": "tool-07", "agent_case_id": "delete_strain_requires_approval", "mode": "decision", "should_call": true},
+    {"id": "tool-08", "agent_case_id": "workflow_missing_strain_requires_clarification", "mode": "decision", "should_call": false},
+    {"id": "tool-09", "agent_case_id": "workflow_with_target_requires_approval", "mode": "decision", "should_call": true},
+    {"id": "tool-10", "agent_case_id": "email_request_creates_draft_boundary", "mode": "decision", "should_call": true},
+    {"id": "tool-11", "agent_case_id": "pending_form_cancel_clears_state", "mode": "runtime", "should_call": false, "multi_turn": true},
+    {"id": "tool-12", "agent_case_id": "pending_form_slot_fill_creates_pending", "mode": "runtime", "should_call": true, "expected_executable": true, "multi_turn": true},
+    {"id": "tool-13", "agent_case_id": "tool_gateway_blocks_unknown_tool", "mode": "runtime", "should_call": true},
+    {"id": "tool-14", "agent_case_id": "frontend_form_can_create_pending_through_gateway", "mode": "runtime", "should_call": true, "expected_executable": true},
+    {"id": "tool-15", "agent_case_id": "chat_runtime_delete_tool_creates_pending_only", "mode": "runtime", "should_call": true, "expected_executable": true, "multi_turn": true}
+  ]
+}

@@ -44,19 +44,32 @@ def test_stateful_simulator_preserves_liquid_mass_balance():
     hardware = SimulatedHardware(delay_seconds=0)
     before = hardware.snapshot()
 
+    hardware.relocate_sample(
+        task_id="load_liquid_handler",
+        location="liquid_handler",
+        container="workcell_labware",
+        carrier="robot_arm",
+    )
+    plate = hardware.prepare_measurement_plate(
+        sample_volume_ml=0.2,
+        blank_volume_ml=0.2,
+    )
     medium = hardware.dispense_medium("Reactor_B", 150.0)
     seed = hardware.transfer_seed("Reactor_A", "Reactor_B", 1.0)
 
+    assert plate.ok is True
     assert medium.ok is True
     assert seed.ok is True
     after = hardware.snapshot()
     assert after["media_reservoir"]["volume_ml"] == pytest.approx(
-        before["media_reservoir"]["volume_ml"] - 150.0
+        before["media_reservoir"]["volume_ml"] - 150.2
     )
     assert after["source_reactor"]["volume_ml"] == pytest.approx(
-        before["source_reactor"]["volume_ml"] - 1.0
+        before["source_reactor"]["volume_ml"] - 1.2
     )
     assert after["target_reactor"]["volume_ml"] == pytest.approx(151.0)
+    assert after["measurement_plate"]["sample_volume_ml"] == pytest.approx(0.2)
+    assert after["measurement_plate"]["blank_volume_ml"] == pytest.approx(0.2)
 
 
 def test_langgraph_success_path_uses_hardware_snapshots():
@@ -67,8 +80,14 @@ def test_langgraph_success_path_uses_hardware_snapshots():
     assert result["generation_number"] == 5
     assert result["hardware_state"]["phase"] == "COMPLETED"
     assert result["hardware_state"]["target_reactor"]["volume_ml"] == pytest.approx(151.0)
+    assert result["hardware_state"]["source_reactor"]["volume_ml"] == pytest.approx(198.8)
+    assert result["hardware_state"]["media_reservoir"]["volume_ml"] == pytest.approx(849.8)
+    assert result["hardware_state"]["measurement_plate"]["status"] == "MEASURED"
+    assert result["hardware_state"]["measurement_plate"]["location"] == "completed_plate_stack"
+    assert result["hardware_state"]["plate_reader"]["wavelength_nm"] == pytest.approx(680.0)
     assert result["measured_absorbance"] == pytest.approx(0.8)
     assert len(result["simulation_events"]) >= 20
+    assert 45_000 <= result["hardware_state"]["simulation_time_ms"] <= 60_000
 
 
 def test_langgraph_hardware_failure_routes_to_safe_shutdown():
@@ -136,8 +155,8 @@ def test_verification_mode_interrupts_and_resumes_all_manual_tasks_once():
     observed = []
 
     for expected_task in [
-        "load_spectrophotometer",
         "load_liquid_handler",
+        "load_spectrophotometer",
         "move_to_incubator",
     ]:
         waiting = wait_for_status(store, run_id, {"WAITING_MANUAL"})
@@ -155,9 +174,11 @@ def test_verification_mode_interrupts_and_resumes_all_manual_tasks_once():
     assert completed["measured_absorbance"] == pytest.approx(1.25)
     assert completed["hardware_state"]["target_reactor"]["volume_ml"] == pytest.approx(151.0)
     manual_actions = [
-        event["action"]
+        event["task_id"]
         for event in completed["events"]
-        if event["device"] == "human_operator" and event["status"] == "completed"
+        if event["device"] == "human_operator"
+        and event["action"] == "place_labware"
+        and event["status"] == "completed"
     ]
     assert manual_actions == observed
 
@@ -243,8 +264,8 @@ def test_fifo_queue_waits_for_active_manual_run():
     assert queued["queue_position"] == 1
 
     for task_id in [
-        "load_spectrophotometer",
         "load_liquid_handler",
+        "load_spectrophotometer",
         "move_to_incubator",
     ]:
         waiting = wait_for_status(store, first["run_id"], {"WAITING_MANUAL"})
@@ -253,6 +274,95 @@ def test_fifo_queue_waits_for_active_manual_run():
 
     assert wait_for_status(store, first["run_id"], {"COMPLETED"})["status"] == "COMPLETED"
     assert wait_for_status(store, second["run_id"], {"COMPLETED"})["status"] == "COMPLETED"
+
+
+def test_demo_mode_uses_robots_for_all_labware_transfers():
+    store = SimulationRunStore(manual_delay_seconds=0)
+    started = store.create(
+        strain_id="Robot_A",
+        generation_number=1,
+        interaction_mode="demo",
+        delay_seconds=0,
+    )
+    completed = wait_for_status(store, started["run_id"], {"COMPLETED", "FAILED"})
+
+    assert completed["status"] == "COMPLETED"
+    carriers = {
+        event["device"]
+        for event in completed["events"]
+        if event["action"] in {"pick_labware", "transport_labware", "place_labware"}
+    }
+    assert carriers == {"robot_arm", "mobile_robot"}
+    assert not any(event["device"] == "human_operator" for event in completed["events"])
+
+
+def test_motion_v2_contract_is_monotonic_and_resource_claims_are_unique():
+    hardware = SimulatedHardware(delay_seconds=0)
+    result = hardware.relocate_sample(
+        task_id="load_spectrophotometer",
+        location="plate_reader",
+        container="measurement_plate",
+        carrier="robot_arm",
+    )
+
+    assert result.ok is True
+    starts = []
+    for event in result.events:
+        command = event["motion_command"]
+        assert command["schema_version"] == "motion-v2"
+        assert command["command_id"]
+        assert command["nominal_duration_ms"] == sum(
+            phase["duration_ms"] for phase in command["phases"]
+        )
+        assert len(command["required_resources"]) == len(
+            set(command["required_resources"])
+        )
+        assert event["snapshot"]["motion_schema_version"] == "motion-v2"
+        starts.append(command["simulation_start_ms"])
+    assert starts == sorted(starts)
+    assert result.state["attachments"]["measurement_plate"] == "plate_reader.slot"
+    assert result.state["entities"]["measurement_plate"]["parent_id"] == "plate_reader.slot"
+
+
+def test_pick_and_place_commands_change_attachment_only_at_verified_phase():
+    hardware = SimulatedHardware(delay_seconds=0)
+    result = hardware.relocate_sample(
+        task_id="load_spectrophotometer",
+        location="plate_reader",
+        container="measurement_plate",
+        carrier="robot_arm",
+    )
+    pick = next(event for event in result.events if event["action"] == "pick_labware")
+    placing = next(
+        event
+        for event in result.events
+        if event["action"] == "place_labware" and event["status"] == "running"
+    )
+    assert pick["motion_command"]["attachment_transition"] == {
+        "entity_id": "measurement_plate",
+        "phase": "grip_verify",
+        "from_parent": "plate_stack.slot_1",
+        "to_parent": "robot_arm.gripper",
+    }
+    assert placing["snapshot"]["attachments"]["measurement_plate"] == "robot_arm.gripper"
+    assert placing["motion_command"]["attachment_transition"]["phase"] == "release"
+
+
+def test_blocked_media_pump_preserves_partial_volume_and_uses_controlled_shutdown():
+    hardware = SimulatedHardware(delay_seconds=0, faults=["pump_a_blocked"])
+    result = hardware.dispense_medium("Reactor_B", 150.0)
+    assert result.ok is False
+    delivered = result.state["target_reactor"]["volume_ml"]
+    assert 0 < delivered < 150.0
+    assert result.state["media_reservoir"]["volume_ml"] == pytest.approx(1000.0 - delivered)
+    assert result.state["device_interlocks"]["media_valve"] == "CLOSED"
+
+    shutdown = hardware.safe_shutdown("pump blocked")
+    actions = [event["action"] for event in shutdown.events]
+    assert actions == ["safe_shutdown", "return_home", "safe_shutdown"]
+    phases = shutdown.events[0]["motion_command"]["phases"]
+    assert phases[0]["name"] == "controlled_deceleration"
+    assert any(phase["name"] == "retract_vertical" for phase in phases)
 
 
 def test_simulation_api_exposes_manual_resolution_and_conflicts(monkeypatch):

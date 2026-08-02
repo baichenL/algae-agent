@@ -6,11 +6,11 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-REST-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-Agent_Runtime-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![MCP](https://img.shields.io/badge/MCP-local_stdio-6F42C1)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-411%20collected-blue)](#-evaluation--verification--评测与验证)
+[![Evaluation](https://img.shields.io/badge/evaluation-auto--generated-0F766E)](#-evaluation--verification--评测与验证)
 
 <p align="center">
   <img
-    src="docs/assets/self-driving-lab-overview.png"
+    src="docs/assets/self-driving_lab_overview.png"
     alt="Algae Agent 微藻自驱动实验室自动化设备与数字孪生平台"
     width="100%"
   />
@@ -385,26 +385,18 @@ Workbench 提供：
 python -m pytest -q
 ```
 
-当前工作区通过 `python -m pytest --collect-only -q` 可收集 **411** 个测试；实际通过状态以当前提交的完整测试运行或 CI 结果为准。
+测试数量与通过状态以当前提交的 CI 为准，不在 README 中手工维护。
 
-### Scientific Eval / 科学闭环评测
+### Interview Evaluation Center / 面试评估中心
 
 ```bash
-python scripts/run_scientific_eval.py
+python scripts/run_eval_showcase.py
 ```
 
-离线、无需在线 LLM 的当前结果：
+该命令统一生成 JSON、自包含 HTML 和 Markdown 摘要。当前数值、样本量、95% CI、backend 和消融结果只从
+[`data/eval_reports/latest.md`](data/eval_reports/latest.md) 自动生成摘要读取，README 不再手工复制分数。
 
-| 指标 | 当前结果 | 评测边界 |
-| --- | ---: | --- |
-| 科学场景 | 31 / 31 passed | 数据质量、指标、诊断边界、补丁、安全和闭环 |
-| Top-3 候选原因命中率 | 100% | 带标签的确定性异常用例 |
-| 保留假设引用覆盖率 | 100% | Eval 临时构建的本地论文语料 |
-| 约束满足与虚实隔离 | 100% | 12 位容量和 simulation provenance 用例 |
-| Full-loop vs no-replan Recovery Gain | +100 pp | 容量超限故障场景 |
-| Simple regret 改进 | 100% | 多固定 seed、17/8 已知二次响应面基准 |
-
-这些是项目内部、可重复的工程 Eval，不等同于湿实验效果或通用科研能力评估。
+确定性 suite 是主要证据；RAGAS/ARES Judge 仅在显式使用 `--judge` 且完成人工校准后运行。所有本地指标均明确标记评估边界，不等同于湿实验效果、官方 BFCL 榜单成绩或通用科研能力。
 
 ### Complete Closed-Loop Demo / 完整闭环演示
 

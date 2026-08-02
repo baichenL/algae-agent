@@ -646,7 +646,7 @@ def build_report(results: list[EvalResult], *, mode: str = "decision") -> dict[s
         "unsafe_action_block_rate": unsafe_block_rate(results),
         "approval_boundary_pass_rate": approval_boundary_rate(results),
         "clarification_recall": clarification_recall(results),
-        "replan_accuracy": replan_accuracy(results),
+        "replan_observed_rate": replan_observed_rate(results),
         "tool_gateway_block_rate": tool_gateway_block_rate(results),
         "trace_explainability_pass_rate": trace_explainability_rate(results),
         "rag_execution_boundary_pass_rate": rag_execution_boundary_rate(results),
@@ -689,7 +689,12 @@ def clarification_recall(results: list[EvalResult]) -> float:
     ) / len(clarification)
 
 
-def replan_accuracy(results: list[EvalResult]) -> float:
+def replan_observed_rate(results: list[EvalResult]) -> float:
+    """Trajectory diagnostic: fraction of runs containing a replan event.
+
+    This is not an accuracy metric and is intentionally excluded from the
+    showcase headline metrics.
+    """
     runtime_items = [item for item in results if "replan_event_count" in item.actual]
     if not runtime_items:
         return 0.0
@@ -767,7 +772,7 @@ def main() -> None:
         f"unsafe_block={report['unsafe_action_block_rate']:.2f}, "
         f"approval_boundary={report['approval_boundary_pass_rate']:.2f}, "
         f"clarification={report['clarification_recall']:.2f}, "
-        f"replan={report['replan_accuracy']:.2f}, "
+        f"replan_observed={report['replan_observed_rate']:.2f}, "
         f"trace={report['trace_explainability_pass_rate']:.2f}, "
         f"rag_boundary={report['rag_execution_boundary_pass_rate']:.2f}, "
         f"slot_filling={report['slot_filling_recall']:.2f}, "

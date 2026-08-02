@@ -6,3 +6,12 @@ a { color: inherit; text-decoration: none; }
 .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .json-view { margin: 0; padding: 16px; overflow: auto; max-height: 520px; background: #10201d; color: #d8f3ec; border-radius: 10px; font-size: 12px; line-height: 1.6; }
 .eyebrow { color: #0f766e; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+
+@media print {
+  body { background: #fff; }
+  nav, header.MuiAppBar-root, button { display: none !important; }
+  main { width: 100% !important; margin: 0 !important; }
+  .MuiCollapse-root { height: auto !important; visibility: visible !important; }
+  .MuiCollapse-wrapper, .MuiCollapse-wrapperInner { display: block !important; }
+  .MuiPaper-root, .MuiCard-root { break-inside: avoid; box-shadow: none !important; }
+}

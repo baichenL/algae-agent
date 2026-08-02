@@ -84,19 +84,74 @@ export interface ReplanSummary {
   final_action?: string; occurred_at?: string; safety_boundary?: string
   debug?: Record<string, any>
 }
+export interface MotionPhase {
+  name: string
+  duration_ms: number
+  easing: 'minimum_jerk' | 's_curve' | 'linear_cruise' | 'hold' | string
+  pose_from?: string
+  pose_to?: string
+  path?: string[]
+}
+export interface AttachmentTransition {
+  entity_id: string
+  phase: string
+  from_parent?: string | null
+  to_parent: string
+}
+export interface MotionCommand {
+  schema_version: 'motion-v2' | string
+  command_id: string
+  actor_id: string
+  entity_id?: string | null
+  action_type: string
+  simulation_start_ms: number
+  nominal_duration_ms: number
+  required_resources: string[]
+  preconditions: string[]
+  postconditions: string[]
+  phases: MotionPhase[]
+  attachment_transition?: AttachmentTransition
+  source_location?: string | null
+  target_location?: string | null
+  interruptibility?: string
+  safe_stop_phase?: string
+}
+export interface SimulationEntity {
+  entity_type: string
+  location?: string
+  parent_id?: string
+  [key: string]: unknown
+}
 export interface SimulationSnapshot {
   phase?: string; uv?: Record<string, any>; media_reservoir?: Record<string, any>
   source_reactor?: Record<string, any>; target_reactor?: Record<string, any>
   media_pump?: Record<string, any>; seed_pump?: Record<string, any>
   valve?: Record<string, any>; incubator?: Record<string, any>
   spectrophotometer?: Record<string, any>; liquid_handler?: Record<string, any>
+  plate_reader?: Record<string, any>; measurement_plate?: Record<string, any>
+  robot_arm?: Record<string, any>; mobile_robot?: Record<string, any>
+  transport?: {
+    carrier?: string | null; labware_id?: string | null
+    source_location?: string | null; target_location?: string | null
+    motion_phase?: string; progress?: number
+  }
+  motion_schema_version?: string
+  simulation_time_ms?: number
+  entities?: Record<string, SimulationEntity>
+  attachments?: Record<string, string>
+  resource_occupancy?: Record<string, string>
+  active_commands?: MotionCommand[]
+  device_interlocks?: Record<string, string>
   sample?: Record<string, any>; alarm?: Record<string, any> | null
 }
 export interface SimulationEvent {
   sequence: number; event_type: string; phase?: string; level: string; created_at?: string
   payload: {
     step?: string; device?: string; action?: string; status?: string
+    task_id?: string
     step_progress?: number; progress?: number; message?: string
+    motion?: SimulationSnapshot['transport']
+    motion_command?: MotionCommand
     snapshot?: SimulationSnapshot; simulation_only?: boolean; error?: unknown
   }
 }
@@ -111,7 +166,16 @@ export interface RunDetail extends RunSummary {
   executions: any[]
   assertions: Assertion[]
   replans?: ReplanSummary[]
-  simulation?: { current_step?: string; progress: number; latest_snapshot?: SimulationSnapshot; event_count: number; replay_available: boolean; last_event_at?: string }
+  simulation?: {
+    current_step?: string
+    progress: number
+    latest_snapshot?: SimulationSnapshot
+    event_count: number
+    replay_available: boolean
+    last_event_at?: string
+    queue_position?: number | null
+    interaction_mode?: string
+  }
   trace?: Record<string, any>
   raw_events?: any[]
   raw?: Record<string, any>
@@ -161,4 +225,51 @@ export interface UserMemorySettings {
   workspace_id: string
   enabled: boolean
   auto_write_low_risk: boolean
+}
+
+export interface EvaluationMetric {
+  key: string
+  display_name: string
+  value: number | null
+  unit: 'ratio' | 'count' | 'milliseconds' | 'tokens' | 'regret'
+  numerator?: number
+  denominator?: number
+  ci95?: [number, number]
+  standard: string
+  reference_url: string
+  evidence_mode: 'deterministic' | 'llm_judge'
+  status: 'completed' | 'not_run' | 'failed'
+  status_reason?: string
+  definition?: string
+  project_target?: number
+}
+
+export interface EvaluationSuite {
+  key: string
+  display_name: string
+  status: 'completed' | 'passed' | 'not_run' | 'failed'
+  status_reason?: string
+  description?: string
+  sample_count: number
+  metrics: EvaluationMetric[]
+  details: Record<string, any>
+}
+
+export interface EvaluationReport {
+  schema_version: '1.0'
+  report_id: string
+  generated_at: string
+  git_commit: string
+  dataset_versions: Record<string, string>
+  environment: {
+    embedding_backend: string
+    reranker_backend: string
+    judge_model?: string
+    judge_enabled?: boolean
+    embedding_used?: boolean
+    reranker_used?: boolean
+    judge_used?: boolean
+  }
+  suites: EvaluationSuite[]
+  comparisons: Array<Record<string, any>>
 }

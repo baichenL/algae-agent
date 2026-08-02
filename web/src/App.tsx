@@ -21,6 +21,7 @@ import ScienceRounded from '@mui/icons-material/ScienceRounded'
 import SettingsRounded from '@mui/icons-material/SettingsRounded'
 import StorageRounded from '@mui/icons-material/StorageRounded'
 import ManageHistoryRounded from '@mui/icons-material/ManageHistoryRounded'
+import AssessmentRounded from '@mui/icons-material/AssessmentRounded'
 import { api, ApiError } from './api'
 import { OperationFeedback } from './components'
 import type { OperationSummary } from './types'
@@ -28,6 +29,7 @@ import {
   ApprovalsPage, AssistantPage, KnowledgePage, OverviewPage, ResourcesPage,
   RunDetailPage, RunsPage, SettingsPage, TestLabPage,
 } from './pages'
+import { EvaluationPage } from './EvaluationPage'
 
 const SimulationPage = lazy(() => import('./simulation').then(module => ({ default: module.SimulationPage })))
 
@@ -40,6 +42,7 @@ const navigation: Array<{ label: string; path: string; icon: React.ReactNode; de
   { label: '审批中心', path: '/approvals', icon: <ApprovalRounded /> },
   { label: '资源', path: '/resources', icon: <StorageRounded /> },
   { label: '知识库', path: '/knowledge', icon: <PsychologyRounded /> },
+  { label: '评估中心', path: '/evaluation', icon: <AssessmentRounded /> },
   { label: 'Agent 调试', path: '/debug/agent', icon: <DnsRounded />, debug: true },
   { label: '设置', path: '/settings', icon: <SettingsRounded /> },
 ]
@@ -123,6 +126,7 @@ export function AppShell({ session }: { session: any }) {
         <Route path="/approvals" element={<ApprovalsPage />} />
         <Route path="/resources" element={<ResourcesPage />} />
         <Route path="/knowledge" element={<KnowledgePage />} />
+        <Route path="/evaluation" element={<EvaluationPage />} />
         <Route path="/debug/agent" element={debugMode ? <RunsPage initialKind="agent" /> : <Navigate to="/settings" replace />} />
         <Route path="/observability" element={<Navigate to="/debug/agent" replace />} />
         <Route path="/settings" element={<SettingsPage session={session} debugMode={debugMode} onDebugModeChange={setMode} />} />

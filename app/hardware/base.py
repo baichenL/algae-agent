@@ -32,6 +32,13 @@ class LiquidHandlerController(Protocol):
 
     def check_materials(self, expected_media_ml: float) -> HardwareResult: ...
 
+    def prepare_measurement_plate(
+        self,
+        *,
+        sample_volume_ml: float,
+        blank_volume_ml: float,
+    ) -> HardwareResult: ...
+
     def dispense_medium(self, target: str, volume_ml: float) -> HardwareResult: ...
 
     def transfer_seed(
@@ -65,6 +72,7 @@ class SubcultureWorkcell(Protocol):
         task_id: str,
         location: str,
         container: str,
+        carrier: str = "human_operator",
     ) -> HardwareResult: ...
 
     def cleanup(self) -> HardwareResult: ...

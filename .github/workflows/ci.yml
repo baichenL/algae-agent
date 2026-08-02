@@ -27,6 +27,15 @@ jobs:
       - run: python scripts/check_rag_encoding.py
       - run: pytest -q
       - run: python scripts/run_scientific_eval.py
+      - run: python scripts/run_eval_showcase.py --output-dir data/eval_reports --skip-capture
+      - run: python scripts/check_eval_summary.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-evaluation-report
+          path: |
+            data/eval_reports/latest.json
+            data/eval_reports/latest.html
+            data/eval_reports/latest.md
 
   windows-core:
     runs-on: windows-latest
@@ -39,3 +48,23 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: pytest -q tests/test_agent_runtime_graph.py tests/test_tool_metadata_policy.py tests/test_scientific_closed_loop.py
       - run: python scripts/run_scientific_eval.py
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+          standalone: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm build

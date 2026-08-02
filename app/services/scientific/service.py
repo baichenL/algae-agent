@@ -11,7 +11,8 @@ from app.core.db import pending_actions
 from app.core.db import scientific as scientific_db
 from app.models.rag_schema import RagQueryRequest
 from app.services.agent_runtime.events import finish_run, record_run_event, start_run
-from app.services.rag.service import answer_rag_question
+from app.services.rag.service import answer_rag_question, citation_from_retrieved_chunk
+from app.core.database import search_rag_chunks
 from app.services.scientific.adapters import get_adapter
 from app.services.scientific.analysis import (
     assess_data_quality,
@@ -113,26 +114,63 @@ def _retrieve_evidence(
     seen: set[tuple[Any, Any]] = set()
     failures = 0
     completed_queries = 0
-    for question in questions:
-        try:
-            response = answer_rag_question(RagQueryRequest(question=question, top_k=5, doc_types=["paper", "manual"]))
-            completed_queries += 1
-        except Exception:
-            failures += 1
-            continue
-        if response.blocked:
-            failures += 1
-            continue
-        for item in response.citations:
-            payload = item.model_dump()
-            key = (payload.get("source_id"), payload.get("chunk_id"))
-            if key not in seen:
-                seen.add(key)
-                citations.append(payload)
+    offline_fts = os.getenv("SCIENTIFIC_EVIDENCE_OFFLINE_FTS", "false").casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not offline_fts:
+        for question in questions:
+            try:
+                response = answer_rag_question(RagQueryRequest(question=question, top_k=5, doc_types=["paper", "manual"]))
+                completed_queries += 1
+            except Exception:
+                failures += 1
+                continue
+            if response.blocked:
+                failures += 1
+                continue
+            for item in response.citations:
+                payload = item.model_dump()
+                key = (payload.get("source_id"), payload.get("chunk_id"))
+                if key not in seen:
+                    seen.add(key)
+                    citations.append(payload)
+                if len(citations) >= 5:
+                    break
             if len(citations) >= 5:
                 break
-        if len(citations) >= 5:
-            break
+    # The answerability layer can conservatively decline to synthesize an
+    # answer even when the index contains useful background evidence. Scientific
+    # diagnosis only needs read-only provenance, so fall back to the same real
+    # retriever and retain complete source locators instead of fabricating a
+    # citation or treating an empty answer as an empty index.
+    if not citations:
+        for question in questions:
+            try:
+                chunks = search_rag_chunks(
+                    question,
+                    top_k=5,
+                    doc_types=["paper", "manual"],
+                )
+            except Exception:
+                failures += 1
+                continue
+            completed_queries += 1
+            for chunk in chunks:
+                source_id = int(chunk.get("knowledge_source_id") or chunk.get("document_id") or 0)
+                if not source_id:
+                    continue
+                payload = citation_from_retrieved_chunk(source_id, chunk).model_dump()
+                key = (payload.get("source_id"), payload.get("chunk_id"))
+                if key not in seen:
+                    seen.add(key)
+                    citations.append(payload)
+                if len(citations) >= 5:
+                    break
+            if citations:
+                break
     if citations and failures:
         status = "degraded"
     elif citations:

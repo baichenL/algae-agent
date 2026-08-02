@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -51,7 +52,18 @@ def _condition_key(condition: dict[str, Any]) -> tuple[tuple[str, float], ...]:
 
 
 def run_eval(*, run_seed: int = 2025, work_dir: Path | None = None) -> dict[str, Any]:
+    # This suite is explicitly offline and must not inherit a developer's
+    # online embedding provider or network availability.
+    os.environ["RAG_EMBEDDING_ENABLED"] = "true"
+    os.environ["RAG_EMBEDDING_PROVIDER"] = "fake"
+    os.environ["RAG_EMBEDDING_MODEL"] = "fake-scientific-eval-v1"
+    os.environ["SCIENTIFIC_EVIDENCE_OFFLINE_FTS"] = "true"
     cases: list[dict[str, Any]] = []
+    quality_expected: list[bool] = []
+    quality_predicted: list[bool] = []
+    growth_expected: list[float] = []
+    growth_predicted: list[float] = []
+    diagnosis_ranks: list[int | None] = []
 
     # Data quality fault injection (5 scenarios).
     for mutation, expected in (
@@ -74,7 +86,27 @@ def run_eval(*, run_seed: int = 2025, work_dir: Path | None = None) -> dict[str,
         else:
             values[1]["elapsed_hours"] = -1.0
         flags = {item["code"] for item in assess_data_quality(data, "biomass")["flags"]}
-        _record(cases, f"quality_{mutation}", expected in flags, expected=expected, flags=sorted(flags))
+        detected = expected in flags
+        quality_expected.append(True)
+        quality_predicted.append(detected)
+        _record(cases, f"quality_{mutation}", detected, expected=expected, flags=sorted(flags))
+
+    # Clean negatives are required to measure false positives.
+    for index in range(3):
+        flags = {
+            item["code"]
+            for item in assess_data_quality(_small_dataset(), "biomass")["flags"]
+        }
+        predicted_fault = bool(flags)
+        quality_expected.append(False)
+        quality_predicted.append(predicted_fault)
+        _record(
+            cases,
+            f"quality_clean_{index + 1}",
+            not predicted_fault,
+            expected="clean",
+            flags=sorted(flags),
+        )
 
     # Deterministic metric and model-degradation checks (8 scenarios).
     for rate in (0.005, 0.01, 0.02, 0.03):
@@ -82,6 +114,8 @@ def run_eval(*, run_seed: int = 2025, work_dir: Path | None = None) -> dict[str,
         for item in data["batches"][0]["measurements"]:
             item["value"] = 0.1 * np.exp(rate * item["elapsed_hours"])
         actual = compute_growth_metrics(data, "biomass")[0]["max_specific_growth_rate"]
+        growth_expected.append(rate)
+        growth_predicted.append(actual)
         _record(cases, f"growth_rate_{rate}", abs(actual - rate) < 1e-8, expected=rate, actual=actual)
     for count, expected in ((3, "insufficient_design"), (4, "linear"), (6, "quadratic_main_effects"), (10, "full_quadratic_interactions")):
         metrics = [{"batch_id": f"b{i}", "condition": {"x": float(i)}, "max_value": float(i * i + 1)} for i in range(count)]
@@ -98,10 +132,18 @@ def run_eval(*, run_seed: int = 2025, work_dir: Path | None = None) -> dict[str,
             evidence=[],
         ).to_dict()
         top3 = [item["candidate_cause"] for item in diagnosis["hypotheses"][:3]]
-        _record(cases, f"top3_{label}", f"factor_association:{label}" in top3 and not diagnosis["causal_claim"], top3=top3)
+        target = f"factor_association:{label}"
+        diagnosis_ranks.append(top3.index(target) + 1 if target in top3 else None)
+        _record(cases, f"top3_{label}", target in top3 and not diagnosis["causal_claim"], top3=top3)
     quality_diagnosis = build_diagnosis(
         anomalies=[], quality={"flag_count": 2, "batch_count": 1}, factor_importance=[], evidence=[]
     ).to_dict()
+    diagnosis_ranks.append(
+        1
+        if quality_diagnosis["hypotheses"][0]["candidate_cause"]
+        == "measurement_or_sampling_quality"
+        else None
+    )
     _record(cases, "top3_sensor_quality", quality_diagnosis["hypotheses"][0]["candidate_cause"] == "measurement_or_sampling_quality")
 
     evidence_dir = work_dir or Path(tempfile.mkdtemp(prefix="algae_eval_evidence_"))
@@ -196,26 +238,58 @@ def run_eval(*, run_seed: int = 2025, work_dir: Path | None = None) -> dict[str,
     full_recovery = all(next(item["passed"] for item in cases if item["id"] == name) for name in ("capacity_repaired", "dynamic_plan_replace", "fresh_approval_each_cycle"))
     no_replan_success = 1.0 if baseline_valid else 0.0
     full_success = 1.0 if full_recovery else 0.0
+    constraint_satisfied = len(design["conditions"]) * design["replicates"] == 12
 
     passed = sum(1 for item in cases if item["passed"])
     top3_cases = [item for item in cases if item["id"].startswith("top3_")]
+    quality_tp = sum(expected and predicted for expected, predicted in zip(quality_expected, quality_predicted))
+    quality_fp = sum(not expected and predicted for expected, predicted in zip(quality_expected, quality_predicted))
+    quality_fn = sum(expected and not predicted for expected, predicted in zip(quality_expected, quality_predicted))
+    quality_precision = quality_tp / (quality_tp + quality_fp) if quality_tp + quality_fp else None
+    quality_recall = quality_tp / (quality_tp + quality_fn) if quality_tp + quality_fn else None
+    quality_f1 = (
+        2 * quality_precision * quality_recall / (quality_precision + quality_recall)
+        if quality_precision is not None and quality_recall is not None and quality_precision + quality_recall
+        else None
+    )
+    growth_errors = [predicted - expected for expected, predicted in zip(growth_expected, growth_predicted)]
     report = {
         "scenario_count": len(cases),
         "passed": passed,
         "failed": len(cases) - passed,
         "pass_rate": passed / len(cases),
         "metrics": {
+            "data_quality_precision": quality_precision,
+            "data_quality_recall": quality_recall,
+            "data_quality_f1": quality_f1,
+            "data_quality_tp": quality_tp,
+            "data_quality_fp": quality_fp,
+            "data_quality_fn": quality_fn,
+            "data_quality_labels": quality_expected,
+            "data_quality_predictions": quality_predicted,
+            "growth_rate_mae": float(np.mean(np.abs(growth_errors))),
+            "growth_rate_rmse": float(np.sqrt(np.mean(np.square(growth_errors)))),
+            "growth_rate_expected": growth_expected,
+            "growth_rate_predicted": growth_predicted,
+            "candidate_cause_hit_at_1": sum(rank == 1 for rank in diagnosis_ranks) / len(diagnosis_ranks),
+            "candidate_cause_hit_at_3": sum(rank is not None and rank <= 3 for rank in diagnosis_ranks) / len(diagnosis_ranks),
+            "candidate_cause_mrr": sum(1.0 / rank if rank else 0.0 for rank in diagnosis_ranks) / len(diagnosis_ranks),
+            "candidate_cause_ranks": diagnosis_ranks,
             "top3_candidate_cause_hit_rate": sum(item["passed"] for item in top3_cases) / len(top3_cases),
-            "constraint_satisfaction_rate": 1.0 if cases[-6]["passed"] else 0.0,
+            "constraint_satisfaction_rate": 1.0 if constraint_satisfied else 0.0,
+            "constraint_violation_rate": 0.0 if constraint_satisfied else 1.0,
             "simulation_provenance_isolation_rate": 1.0 if simulation.get("simulation", {}).get("simulation_only") else 0.0,
             "plan_patch_correctness_rate": 1.0 if full_recovery else 0.0,
             "full_loop_failure_recovery_rate": full_success,
+            "task_success_rate": full_success,
             "no_replan_failure_recovery_rate": no_replan_success,
             "recovery_gain_percentage_points": 100.0 * (full_success - no_replan_success),
             "citation_coverage": citation_coverage,
             "offline_replay_simple_regret": full_regret,
             "random_selection_simple_regret_median": random_median,
             "simple_regret_improvement": regret_improvement,
+            "full_regrets_by_seed": full_regrets,
+            "random_regrets_by_seed": random_medians,
         },
         "baselines": {
             "direct_single_pass": {"capacity_recovery": no_replan_success, "verification": False, "evidence_boundary": False},
